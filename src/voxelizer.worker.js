@@ -1,6 +1,9 @@
+import { createVoxelTextureSampler } from './voxel-texture-sampler.js';
+import { batchPackedVoxelChunks } from './packed-voxel-batching.js';
 /* voxelizer.worker.js (REPLACEMENT) */
 
 import * as THREE from 'three';
+import { meshVoxelChunks } from './greedy-mesher.js';
 import { mergeGeometries } from 'three/addons/utils/BufferGeometryUtils.js';
 import initDdaVoxelizeWasm, {
     rasterize_mesh_2d5_packed,
@@ -75,10 +78,17 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
     let tMin = min(min(v0, v1), v2);
     let tMax = max(max(v0, v1), v2);
     let gridMax = vec3<i32>(params.gDim) - vec3<i32>(1, 1, 1);
-    let rawMin = vec3<i32>(vec3<f32>((tMin - params.bMin) / params.voxelSize));
-    let rawMax = vec3<i32>(vec3<f32>((tMax - params.bMin) / params.voxelSize));
-    let vMin = vec3<u32>(max(vec3<i32>(0, 0, 0), rawMin));
-    let vMax = vec3<u32>(min(gridMax, rawMax));
+    let tileMax = params.bMin + vec3<f32>(params.gDim) * params.voxelSize;
+    if (any(tMax < params.bMin) || any(tMin > tileMax)) {
+        return;
+    }
+    // A triangle exactly on the positive grid boundary belongs to the final
+    // cell. Clamp both ends before converting to unsigned (negative bounds
+    // on other tiles must never wrap into enormous loop limits).
+    let rawMin = vec3<i32>(floor((tMin - params.bMin) / params.voxelSize));
+    let rawMax = vec3<i32>(floor((tMax - params.bMin) / params.voxelSize));
+    let vMin = vec3<u32>(clamp(rawMin, vec3<i32>(0), gridMax));
+    let vMax = vec3<u32>(clamp(rawMax, vec3<i32>(0), gridMax));
 
     let half = params.voxelSize * 0.5;
     let nx = params.gDim.x;
@@ -453,7 +463,8 @@ class ChunkIndexer {
 }
 
 class PaletteChunkStore {
-    constructor(nx, ny, nz, chunkSize = DEFAULT_CHUNK_SIZE) {
+    constructor(nx, ny, nz, chunkSize = DEFAULT_CHUNK_SIZE, ArrayType = Uint16Array) {
+        this.ArrayType = ArrayType;
         this.indexer = new ChunkIndexer(nx, ny, nz, chunkSize);
         this.chunks = new Map();
     }
@@ -463,7 +474,7 @@ class PaletteChunkStore {
         if (!loc) return;
         let chunk = this.chunks.get(loc.key);
         if (!chunk) {
-            chunk = { cx: loc.cx, cy: loc.cy, cz: loc.cz, data: new Uint16Array(this.indexer.chunkVolume) };
+            chunk = { cx: loc.cx, cy: loc.cy, cz: loc.cz, data: new this.ArrayType(this.indexer.chunkVolume) };
             this.chunks.set(loc.key, chunk);
         }
         chunk.data[loc.localIndex] = value;
@@ -614,6 +625,19 @@ class ColorChunkStore {
         return { voxelColors, voxelCounts };
     }
 
+    toSparsePayload() {
+        const total = this.nx * this.ny * this.nz;
+        const indices = total > 0xffffffff ? new Float64Array(this.filledCount) : new Uint32Array(this.filledCount);
+        const colors = new Uint32Array(this.filledCount);
+        const linearByte = c => Math.round(255 * Math.min(1, Math.max(0, c <= .04045 ? c / 12.92 : ((c + .055) / 1.055) ** 2.4)));
+        let at = 0;
+        this.forEachVoxel((x, y, z, r, g, b, alpha) => {
+            indices[at] = x + this.nx * (y + this.ny * z);
+            colors[at++] = linearByte(r) | (linearByte(g) << 8) | (linearByte(b) << 16) | (Math.round(alpha * 255) << 24);
+        });
+        return { indices, colors };
+    }
+
     toChunkPayload() {
         const chunks = [];
         for (const chunk of this.chunks.values()) {
@@ -666,66 +690,7 @@ function getSampler(tex, imageDatas) {
     if (!tex || !tex.source || !imageDatas.has(tex.source.uuid)) return null;
     if (_samplers.has(tex)) return _samplers.get(tex);
 
-    let sampler = null;
-    const imgData = imageDatas.get(tex.source.uuid);
-
-    if (imgData) {
-        const { data, width, height } = imgData;
-        const { offset, repeat, rotation, center, flipY, wrapS, wrapT } = tex;
-        const cosR = Math.cos(rotation), sinR = Math.sin(rotation);
-
-        // sRGB -> linear helper
-        const srgbToLin = x => (x <= 0.04045) ? (x / 12.92) : Math.pow((x + 0.055) / 1.055, 2.4);
-
-        sampler = (uv, wantRGBA = false) => {
-            let u = uv.x * repeat.x + offset.x, v = uv.y * repeat.y + offset.y;
-            if (rotation !== 0) {
-                u -= center.x; v -= center.y;
-                const u2 = u * cosR - v * sinR, v2 = u * sinR + v * cosR;
-                u = u2 + center.x; v = v2 + center.y;
-            }
-            u = wrapS === THREE.RepeatWrapping ? ((u % 1) + 1) % 1 : THREE.MathUtils.clamp(u, 0, 1);
-            v = wrapT === THREE.RepeatWrapping ? ((v % 1) + 1) % 1 : THREE.MathUtils.clamp(v, 0, 1);
-            if (flipY) v = 1 - v;
-
-            const x = u * (width - 1), y = v * (height - 1);
-            const x0 = Math.floor(x), x1 = Math.min(width - 1, x0 + 1);
-            const y0 = Math.floor(y), y1 = Math.min(height - 1, y0 + 1);
-            const tx = x - x0, ty = y - y0;
-
-            const sample = (ix, iy) => {
-                const i = (iy * width + ix) * 4;
-                let r = data[i] / 255, g = data[i+1] / 255, b = data[i+2] / 255, a = data[i+3] / 255;
-                // convert EACH texel to linear before mixing
-                if (isSRGBTexture(tex)) {
-                    r = srgbToLin(r); g = srgbToLin(g); b = srgbToLin(b);
-                }
-                return [r, g, b, a];
-            };
-
-            const c00 = sample(x0, y0), c10 = sample(x1, y0), c01 = sample(x0, y1), c11 = sample(x1, y1);
-            
-            // premultiplied bilinear blend: RGB*A, then divide by A
-            const w00 = (1 - tx) * (1 - ty);
-            const w10 = tx * (1 - ty);
-            const w01 = (1 - tx) * ty;
-            const w11 = tx * ty;
-
-            const a = c00[3]*w00 + c10[3]*w10 + c01[3]*w01 + c11[3]*w11;
-            let r = c00[0]*c00[3]*w00 + c10[0]*c10[3]*w10 + c01[0]*c01[3]*w01 + c11[0]*c11[3]*w11;
-            let g = c00[1]*c00[3]*w00 + c10[1]*c10[3]*w10 + c01[1]*c01[3]*w01 + c11[1]*c11[3]*w11;
-            let b = c00[2]*c00[3]*w00 + c10[2]*c10[3]*w10 + c01[2]*c01[3]*w01 + c11[2]*c11[3]*w11;
-
-            if (a > 1e-5) { r /= a; g /= a; b /= a; } // unpremultiply
-            else { r = 0; g = 0; b = 0; }             // fully transparent → neutral
-
-            return wantRGBA ? [r, g, b, a] : [r, g, b];
-        };
-        
-        // expose 1-pixel UV deltas for neighborhood taps
-        sampler._du = 1 / width;
-        sampler._dv = 1 / height;
-    }
+    const sampler = createVoxelTextureSampler(imageDatas.get(tex.source.uuid), tex, isSRGBTexture(tex));
     _samplers.set(tex, sampler);
     return sampler;
 }
@@ -977,6 +942,7 @@ export class WorkerVoxelizer {
 
         return {
             geometries: result.geometries ?? [],
+            packedChunks: result.packedChunks ?? [],
             instanceChunks: result.instanceChunks ?? [],
             voxelCount: this.filledVoxelCount,
             voxelGrid: voxelGridData,
@@ -993,6 +959,7 @@ export class WorkerVoxelizer {
                 method: this.method,
                 requestedMethod,
                 renderMode: this.renderMode,
+                mesh: result.meshStats ?? null,
                 fallbackReason,
                 hitStoreMode: this._rasterResult?.voxelHits?.mode ?? hitStoreMode,
                 wasmInitMs,
@@ -1560,6 +1527,9 @@ export class WorkerVoxelizer {
                     }
                 }
 
+                // Exact-color surface previews never use the k-means palette.
+                // Avoid sampling vertices and clustering colors that will be discarded.
+                if (this.renderMode === 'packed' || this.renderMode === 'surface') continue;
                 const sampleBudget = Math.min(group.count, 192);
                 if (!sampleBudget) continue;
                 const sampleStep = Math.max(1, Math.floor(group.count / sampleBudget));
@@ -2416,7 +2386,9 @@ export class WorkerVoxelizer {
 
       // 1) Build sparse chunked stores for palette ids and voxel colors
       const CHUNK = directInstances ? DIRECT_INSTANCE_CHUNK_SIZE : DEFAULT_CHUNK_SIZE;
-      const paletteStore = new PaletteChunkStore(NX, NY, NZ, CHUNK);
+      const exactColors = this.renderMode === 'surface' || this.renderMode === 'packed';
+      const paletteStore = new PaletteChunkStore(NX, NY, NZ, CHUNK, exactColors ? Uint32Array : Uint16Array);
+      const packColor = (r, g, b) => (0xff000000 | (Math.round(r * 255)) | (Math.round(g * 255) << 8) | (Math.round(b * 255) << 16)) >>> 0;
       const colorStore = new ColorChunkStore(NX, NY, NZ, CHUNK);
       const linToSRGB = (x) => (x <= 0.0031308 ? 12.92 * x : 1.055 * Math.pow(x, 1/2.4) - 0.055);
       const palette = this.palette ?? new Float32Array([1, 1, 1]);
@@ -2464,7 +2436,7 @@ export class WorkerVoxelizer {
           const d2 = dr*dr + dg*dg + db*db;
           if (d2 < bestD) { bestD = d2; best = c; }
         }
-        return { rr, gg, bb, paletteId: best + 1 };
+        return { rr, gg, bb, paletteId: exactColors ? packColor(r, g, b) : best + 1 };
       });
 
       const { voxelHits } = this._rasterResult;
@@ -2481,7 +2453,7 @@ export class WorkerVoxelizer {
         const triMatIdx = this.triMats[triId] ?? 0;
         const flatInfo = flatMaterialCache[triMatIdx];
         if (flatInfo) {
-          colorStore.accumulate(gx, gy, gz, flatInfo.rr, flatInfo.gg, flatInfo.bb, 1);
+          if (this.needGrid || directInstances) colorStore.accumulate(gx, gy, gz, flatInfo.rr, flatInfo.gg, flatInfo.bb, 1);
           paletteStore.set(gx, gy, gz, flatInfo.paletteId);
           return;
         }
@@ -2560,11 +2532,18 @@ export class WorkerVoxelizer {
         g = Math.min(1, Math.max(0, g));
         b = Math.min(1, Math.max(0, b));
 
-        // Record true per-voxel averages in sRGB space (for KD queries later)
-        const rr = Math.min(1, Math.max(0, linToSRGB(r)));
-        const gg = Math.min(1, Math.max(0, linToSRGB(g)));
-        const bb = Math.min(1, Math.max(0, linToSRGB(b)));
-        colorStore.accumulate(gx, gy, gz, rr, gg, bb, coverage);
+        // Preview geometry uses linear bytes directly. Retain sRGB averages
+        // only when export/atlas assignment or legacy cubes actually need them.
+        if (this.needGrid || directInstances) {
+          const rr = Math.min(1, Math.max(0, linToSRGB(r)));
+          const gg = Math.min(1, Math.max(0, linToSRGB(g)));
+          const bb = Math.min(1, Math.max(0, linToSRGB(b)));
+          colorStore.accumulate(gx, gy, gz, rr, gg, bb, coverage);
+        }
+        if (exactColors) {
+          paletteStore.set(gx, gy, gz, packColor(r, g, b));
+          return;
+        }
 
         // choose nearest palette entry (use actual palette length!)
         let best = 0, bestD = Infinity;
@@ -2598,208 +2577,13 @@ export class WorkerVoxelizer {
         };
       }
 
-      // 2) Greedy mesh per CHUNK (greatly reduces triangles & allows culling)
-      const chunks = [];
-      const bx = this.bbox.min.x, by = this.bbox.min.y, bz = this.bbox.min.z;
-      const vs = this.voxelSize;
-
-      // Reusable mask (max CHUNK*CHUNK)
-      const mask = new Int32Array(CHUNK * CHUNK);
-
-      const sample = (x,y,z) => paletteStore.get(x,y,z);
-
-    // helper to emit a quad into arrays with correct winding (no normals)
-    function pushQuad(out, p, q, r, s, nrm, colorIdx) {
-        const base = out.positions.length / 3;
-        // positions
-        out.positions.push(
-          p[0], p[1], p[2],
-          q[0], q[1], q[2],
-          r[0], r[1], r[2],
-          s[0], s[1], s[2]
-        );
-        const colorOffset = colorIdx * 4;
-        const R = paletteColors8[colorOffset + 0];
-        const G = paletteColors8[colorOffset + 1];
-        const B = paletteColors8[colorOffset + 2];
-        out.colors8.push(
-          R, G, B, 255,
-          R, G, B, 255,
-          R, G, B, 255,
-          R, G, B, 255
-        );
-        
-        // Check winding order and emit triangles with correct CCW orientation
-        // Calculate face cross product to determine if we need to flip
-        const ax = q[0] - p[0], ay = q[1] - p[1], az = q[2] - p[2]; // edge p->q
-        const bx = r[0] - p[0], by = r[1] - p[1], bz = r[2] - p[2]; // edge p->r
-        
-        // cross = (q - p) × (r - p)
-        const cx = ay * bz - az * by;
-        const cy = az * bx - ax * bz;
-        const cz = ax * by - ay * bx;
-        
-        // dot with intended outward normal
-        const dot = cx * nrm[0] + cy * nrm[1] + cz * nrm[2];
-        
-        if (dot >= 0) {
-          // CCW already → keep original order
-          out.indices.push(base+0, base+1, base+2, base+0, base+2, base+3);
-        } else {
-          // flip winding to make CCW
-          out.indices.push(base+0, base+2, base+1, base+0, base+3, base+2);
-        }
-      }
-
-      // Run greedy meshing within a chunk
-      const meshChunk = (cx0, cx1, cy0, cy1, cz0, cz1) => {
-    const out = { positions: [], colors8: [], indices: [] };
-
-        // axis loop: 0=X,1=Y,2=Z (like Mikola Lysenko's algorithm)
-        for (let d = 0; d < 3; d++) {
-          const u = (d + 1) % 3;
-          const v = (d + 2) % 3;
-
-          const r0 = [cx0, cy0, cz0];
-          const r1 = [cx1, cy1, cz1];
-
-          const minD = (d===0?cx0:(d===1?cy0:cz0));
-          const maxD = (d===0?cx1:(d===1?cy1:cz1));
-
-          const minU = (u===0?cx0:(u===1?cy0:cz0));
-          const maxU = (u===0?cx1:(u===1?cy1:cz1));
-
-          const minV = (v===0?cx0:(v===1?cy0:cz0));
-          const maxV = (v===0?cx1:(v===1?cy1:cz1));
-
-          for (let x = minD; x <= maxD; x++) { // note <= because we compare between x-1 and x
-            const nu = (maxU - minU);
-            const nv = (maxV - minV);
-            if (nu === 0 || nv === 0) continue;
-
-            // build mask for this plane
-            const planeSize = nu * nv;
-            let n = 0;
-            for (let j = minV; j < maxV; j++) {
-              for (let i = minU; i < maxU; i++) {
-                // get voxel on both sides of the plane
-                const a = (d===0) ? sample(x-1, i, j)
-                          : (d===1) ? sample(j, x-1, i)   // Y-sweep: (X=j, Y=plane, Z=i)
-                          : sample(i, j, x-1);
-                const b = (d===0) ? sample(x, i, j)
-                          : (d===1) ? sample(j, x, i)
-                          : sample(i, j, x);
-                let id = 0;
-                if ((a !== 0) !== (b !== 0)) {
-                  // sign encodes which side is solid; magnitude encodes color id
-                  id = (b !== 0 ? +1 : -1) * (b !== 0 ? b : a);
-                }
-                mask[n++] = id;
-              }
-            }
-
-            // greedy merge rectangles in mask
-            n = 0;
-            for (let j = 0; j < nv; j++) {
-              for (let i = 0; i < nu; ) {
-                const c = mask[n];
-                if (c) {
-                  // compute width
-                  let w = 1;
-                  while (i + w < nu && mask[n + w] === c) w++;
-
-                  // compute height
-                  let h = 1, k;
-                  outer: for (; j + h < nv; h++) {
-                    for (k = 0; k < w; k++) {
-                      if (mask[n + k + h * nu] !== c) break outer;
-                    }
-                  }
-
-                  // emit quad for rectangle (i..i+w-1, j..j+h-1)
-                  const side = Math.sign(c);            // +1 or -1
-                  const colId = Math.abs(c) - 1;       // palette index
-
-                  // corners in voxel grid coords
-                  const xPlane = x;                     // face lies on plane 'x' (between x-1 and x)
-                  const iu0 = minU + i, iu1 = iu0 + w;
-                  const iv0 = minV + j, iv1 = iv0 + h;
-
-                  // build 4 corners in [x,y,z] integer space
-                  let p = [0,0,0], q = [0,0,0], r = [0,0,0], s = [0,0,0];
-                  if (d === 0) { // X
-                    p = [xPlane, iu0, iv0]; q = [xPlane, iu1, iv0];
-                    r = [xPlane, iu1, iv1]; s = [xPlane, iu0, iv1];
-                  } else if (d === 1) { // Y plane (u = Z, v = X)
-                    p = [iv0, xPlane, iu0]; q = [iv1, xPlane, iu0];
-                    r = [iv1, xPlane, iu1]; s = [iv0, xPlane, iu1];
-                  } else { // Z
-                    p = [iu0, iv0, xPlane]; q = [iu1, iv0, xPlane];
-                    r = [iu1, iv1, xPlane]; s = [iu0, iv1, xPlane];
-                  }
-
-                  // scale to world space
-                  const P = [bx + p[0]*vs, by + p[1]*vs, bz + p[2]*vs];
-                  const Q = [bx + q[0]*vs, by + q[1]*vs, bz + q[2]*vs];
-                  const R = [bx + r[0]*vs, by + r[1]*vs, bz + r[2]*vs];
-                  const S = [bx + s[0]*vs, by + s[1]*vs, bz + s[2]*vs];
-
-                  // normals & winding (so they point outward from solid)
-                  let nrm = [0,0,0];
-                  if (d === 0) { nrm = [ -side, 0, 0]; }  // outward = opposite of solid side
-                  if (d === 1) { nrm = [ 0, -side, 0]; }
-                  if (d === 2) { nrm = [ 0, 0, -side]; }
-
-                  // Always emit in consistent order - pushQuad will handle winding correction
-                  pushQuad(out, P, Q, R, S, nrm, colId);
-
-                  // zero out the mask we just consumed
-                  for (let jj = 0; jj < h; jj++) {
-                    for (let ii = 0; ii < w; ii++) {
-                      mask[n + ii + jj * nu] = 0;
-                    }
-                  }
-                  i += w; n += w;
-                } else {
-                  i++; n++;
-                }
-              }
-            } // end sweep over mask rows
-          } // end sweep along axis d
-        } // end axis loop
-
-        // pack to typed arrays
-        const positions = new Float32Array(out.positions);
-    const colors8   = new Uint8Array(out.colors8);
-    const indices   = positions.length/3 >= 65536 ? new Uint32Array(out.indices) : new Uint16Array(out.indices);
-
-        // chunk bounds in world space (for frustum culling on the main thread)
-        const bounds = {
-          min: [bx + cx0*vs, by + cy0*vs, bz + cz0*vs],
-          max: [bx + cx1*vs, by + cy1*vs, bz + cz1*vs],
-        };
-
-    return { positions, colors8, indices, bounds };
-      };
-
-      // iterate chunks
-      const geometries = [];
-      for (let z0 = 0; z0 < NZ; z0 += CHUNK) {
-        for (let y0 = 0; y0 < NY; y0 += CHUNK) {
-          for (let x0 = 0; x0 < NX; x0 += CHUNK) {
-            const x1 = Math.min(NX, x0 + CHUNK);
-            const y1 = Math.min(NY, y0 + CHUNK);
-            const z1 = Math.min(NZ, z0 + CHUNK);
-
-            const g = meshChunk(x0, x1, y0, y1, z0, z1);
-            if (g.indices.length) geometries.push(g);
-          }
-        }
-      }
-
-      // expose color store for voxel grid serialization
       this._colorStore = colorStore;
-      return { geometries };
+      return meshVoxelChunks(paletteStore, {
+        origin: [this.bbox.min.x, this.bbox.min.y, this.bbox.min.z],
+        voxelSize: this.voxelSize,
+        paletteColors8: exactColors ? null : paletteColors8,
+        packed: this.renderMode === 'packed',
+      });
     }
 
     #buildDirectVoxelInstanceChunksFromColorStore(colorStore) {
@@ -3017,7 +2801,14 @@ export class WorkerVoxelizer {
         };
 
         if (this._colorStore) {
-            if (tot <= MAX_GRID_VOXELS) {
+            if (this.renderMode === 'packed') {
+                base.colorSpace = 'linear';
+                base.blockMatching = 'packed';
+                base.sparse = this._colorStore.toSparsePayload();
+                this._colorStore = null;
+                return base;
+            }
+            if (tot <= MAX_GRID_VOXELS && this.renderMode !== 'packed') {
                 const dense = this._colorStore.toDense(tot);
                 base.voxelColors = dense.voxelColors;
                 base.voxelCounts = dense.voxelCounts;
@@ -3093,9 +2884,21 @@ if (typeof self !== 'undefined') {
                 result = await voxelizer.init({ modelData, voxelSize, needGrid, method, renderMode, hitStoreMode });
             }
 
+            if (result.packedChunks?.length && event.data.batchPacked !== false) {
+                const started = nowMs();
+                result.packedChunks = batchPackedVoxelChunks(result.packedChunks);
+                const mesh = result.stats.mesh;
+                mesh.drawChunkCount = result.packedChunks.length;
+                mesh.geometryBytes = result.packedChunks.reduce((sum, c) => sum + c.quads.byteLength + (c.chunkOffsets?.byteLength ?? 0), 0);
+                mesh.atlasBytes = result.packedChunks.reduce((sum, c) => sum + (c.atlas?.byteLength ?? 0), 0);
+                mesh.renderBytes = mesh.geometryBytes + mesh.atlasBytes;
+                result.stats.batchMeshMs = nowMs() - started;
+                result.stats.totalMs += result.stats.batchMeshMs;
+            }
             const transferList = [];
             if (result.voxelGrid?.voxelColors) transferList.push(result.voxelGrid.voxelColors.buffer);
             if (result.voxelGrid?.voxelCounts) transferList.push(result.voxelGrid.voxelCounts.buffer);
+            if (result.voxelGrid?.sparse) transferList.push(result.voxelGrid.sparse.indices.buffer, result.voxelGrid.sparse.colors.buffer);
             if (result.voxelGrid?.chunked?.chunks) {
                 for (const chunk of result.voxelGrid.chunked.chunks) {
                     if (chunk.colors) transferList.push(chunk.colors.buffer);
@@ -3112,6 +2915,11 @@ if (typeof self !== 'undefined') {
             for (const chunk of (result.instanceChunks || [])) {
                 if (chunk?.instanceCoords?.buffer) transferList.push(chunk.instanceCoords.buffer);
                 if (chunk?.colors8?.buffer) transferList.push(chunk.colors8.buffer);
+            }
+            for (const chunk of (result.packedChunks || [])) {
+                transferList.push(chunk.quads.buffer);
+                if (chunk.chunkOffsets) transferList.push(chunk.chunkOffsets.buffer);
+                if (chunk.atlas) transferList.push(chunk.atlas.buffer);
             }
 
             self.postMessage({ status: 'success', result }, transferList);

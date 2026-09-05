@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Voxel rendering benchmark</title>
+  <link rel="icon" href="data:,">
+  <style>
+    body { margin: 0; background: #151c1f; color: #e5eeee; font: 14px system-ui; }
+    canvas { display: block; width: 100%; height: 70vh; object-fit: contain; }
+    main { padding: 20px; } select, button { margin-right: 12px; padding: 8px; }
+    pre { white-space: pre-wrap; } a { color: #8ec5ff; }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>Voxel rendering benchmark</h1>
+    <p>Fixed 3840 × 2160 drawing buffer. Build time, frame pacing, CPU submission and asynchronous GPU timing are reported separately. No map credentials needed.</p>
+    <select id="fixture" aria-label="Fixture"><option value="colored">2.39 million voxels with varying colors</option><option value="terrain">2.39 million terrain voxels</option><option value="solid">2.10 million solid voxels</option><option value="sparse">1.05 million isolated voxels (stress test)</option></select>
+    <select id="mode" aria-label="Rendering"><option value="packed">Packed quads + color atlas</option><option value="regular">Conventional surface mesh</option></select>
+    <button id="run">Run 4K benchmark</button>
+    <pre id="result">Ready. Keep this tab in the foreground while measuring.</pre>
+  </main>
+  <script type="module" src="./voxel-render-benchmark.js"></script>
+</body>
+</html>

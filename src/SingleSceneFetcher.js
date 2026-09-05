@@ -1,3 +1,5 @@
+import { resolveEarthTileUrl } from './config.js';
+
 const EARTH_A = 6378137.0;
 const EARTH_F = 1 / 298.257223563;
 const EARTH_E2 = EARTH_F * (2 - EARTH_F);
@@ -125,7 +127,8 @@ function setSharedSession(id) {
 }
 
 export class SingleSceneFetcher {
-  constructor() {
+  constructor({ concurrency = typeof matchMedia !== 'undefined' && matchMedia('(pointer: coarse)').matches ? 3 : 6 } = {}) {
+    this.concurrency = Math.max(1, concurrency);
     this._sessionKey = null;
     this._sessionTs = 0;
   }
@@ -135,12 +138,18 @@ export class SingleSceneFetcher {
     const centerECEF = cartesianFromDegrees(lng, lat, 0);
     const regionSphere = new Sphere(centerECEF, radius);
     const startingSession = this._isSessionFresh() ? this._sessionKey : (getSharedSession() || null);
-    const sessionRef = { value: startingSession };
+    let active = 0;
+    const waiters = [];
+    const sessionRef = { value: startingSession, visited: new Set(), limit: async fn => {
+      if (active >= this.concurrency) await new Promise(resolve => waiters.push(resolve));
+      else active++;
+      try { return await fn(); }
+      finally { if (waiters.length) waiters.shift()(); else active--; }
+    } };
     if (startingSession) {
       this._sessionKey = startingSession;
       this._sessionTs = Date.now();
     }
-    this._visitedTilesets = new Set();
     const urls = [];
     const rootUrl = rootUrlString ? new URL(rootUrlString) : new URL('https://tile.googleapis.com/v1/3dtiles/root.json');
 
@@ -164,16 +173,17 @@ export class SingleSceneFetcher {
     }
 
     logFn?.(`Found ${urls.length} tile(s).`);
-    return urls;
+    return [...new Set(urls)];
   }
 
   async _walkTileset(url, regionSphere, apiKey, sessionRef, targetSSE, urls, logFn, depth, attempt = 0) {
     if (!url || urls.length >= MAX_TILE_RESULTS) return;
     const urlStr = url.toString();
-    if (attempt === 0 && this._visitedTilesets.has(urlStr)) return;
+    if (attempt === 0 && sessionRef.visited.has(urlStr)) return;
+    sessionRef.visited.add(urlStr);
 
     const urlObj = url instanceof URL ? new URL(url) : new URL(String(url));
-    if (!urlObj.searchParams.has('key')) urlObj.searchParams.set('key', apiKey);
+    if (urlObj.hostname === 'tile.googleapis.com' && apiKey && !urlObj.searchParams.has('key')) urlObj.searchParams.set('key', apiKey);
     if (sessionRef.value && !urlObj.searchParams.has('session')) {
       urlObj.searchParams.set('session', sessionRef.value);
     } else if (!sessionRef.value) {
@@ -184,11 +194,15 @@ export class SingleSceneFetcher {
       }
     }
 
-    let resp;
+    let resp, json;
     try {
-      resp = await fetch(urlObj.toString(), { cache: 'force-cache' });
+      const loaded = await sessionRef.limit(async () => {
+        const response = await fetch(urlObj.toString(), { cache: 'force-cache' });
+        return { response, json: response.ok ? await response.json() : null };
+      });
+      resp = loaded.response; json = loaded.json;
     } catch (err) {
-      logFn?.(`Failed to load ${urlObj.toString()}: ${err?.message || err}`);
+      logFn?.(`Failed to load ${urlObj.pathname}: ${err?.message || err}`);
       return;
     }
     if (!resp.ok) {
@@ -199,17 +213,9 @@ export class SingleSceneFetcher {
           return this._walkTileset(new URL(urlStr), regionSphere, apiKey, sessionRef, targetSSE, urls, logFn, depth, attempt + 1);
         }
       }
-      logFn?.(`HTTP ${resp.status} for ${urlObj.toString()}`);
+      logFn?.(`HTTP ${resp.status} for ${urlObj.pathname}`);
       return;
     }
-    let json;
-    try {
-      json = await resp.json();
-    } catch (err) {
-      logFn?.(`Invalid JSON for ${urlObj.toString()}: ${err?.message || err}`);
-      return;
-    }
-    this._visitedTilesets.add(urlStr);
     try {
       const respSession = new URL(resp.url).searchParams.get('session');
       if (respSession) this._setSession(sessionRef, respSession);
@@ -228,19 +234,23 @@ export class SingleSceneFetcher {
     const shouldRefine = hasChildren && error > targetSSE;
 
     if (shouldRefine) {
-      for (const child of node.children) {
-        if (urls.length >= MAX_TILE_RESULTS) break;
-        await this._walkNode(child, baseUrl, regionSphere, apiKey, sessionRef, targetSSE, urls, logFn, depth + 1);
-      }
+      const branches = await Promise.all(node.children.map(async child => {
+        const found = [];
+        await this._walkNode(child, baseUrl, regionSphere, apiKey, sessionRef, targetSSE, found, logFn, depth + 1);
+        return found;
+      }));
+      for (const found of branches) urls.push(...found);
       return;
     }
 
     const contents = this._gatherContents(node);
     if (!contents.length && hasChildren) {
-      for (const child of node.children) {
-        if (urls.length >= MAX_TILE_RESULTS) break;
-        await this._walkNode(child, baseUrl, regionSphere, apiKey, sessionRef, targetSSE, urls, logFn, depth + 1);
-      }
+      const branches = await Promise.all(node.children.map(async child => {
+        const found = [];
+        await this._walkNode(child, baseUrl, regionSphere, apiKey, sessionRef, targetSSE, found, logFn, depth + 1);
+        return found;
+      }));
+      for (const found of branches) urls.push(...found);
       return;
     }
 
@@ -267,12 +277,12 @@ export class SingleSceneFetcher {
     if (!content?.uri || urls.length >= MAX_TILE_RESULTS) return;
     let contentURL;
     try {
-      contentURL = new URL(content.uri, baseUrl);
+      contentURL = resolveEarthTileUrl(content.uri, baseUrl);
     } catch (e) {
       logFn?.(`Bad content URI ${content.uri}`);
       return;
     }
-    if (!contentURL.searchParams.has('key')) contentURL.searchParams.set('key', apiKey);
+    if (contentURL.hostname === 'tile.googleapis.com' && apiKey && !contentURL.searchParams.has('key')) contentURL.searchParams.set('key', apiKey);
     if (sessionRef.value && !contentURL.searchParams.has('session')) {
       contentURL.searchParams.set('session', sessionRef.value);
     }

@@ -8,6 +8,15 @@
     "build": "vite build",
     "preview": "vite preview",
     "benchmark:voxel": "node scripts/benchmark-performance.mjs",
+    "test:mesher": "node scripts/test-greedy-mesher.mjs",
+    "test:lod": "node scripts/test-voxel-lod.mjs",
+    "test:textures": "node scripts/test-textured-voxels.mjs",
+    "benchmark:earth": "node scripts/benchmark-earth-browser.mjs",
+    "test:map-lod": "node scripts/test-map-lod-browser.mjs",
+    "test:earth-coverage": "node scripts/test-earth-coverage-browser.mjs",
+    "test:export": "node scripts/test-voxel-export.mjs",
+    "test:single-scene": "node scripts/test-single-scene-browser.mjs",
+    "benchmark:mesher": "node scripts/benchmark-mesher.mjs",
     "benchmark:webgpu": "node scripts/benchmark-webgpu-browser.mjs"
   },
   "devDependencies": {

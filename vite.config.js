@@ -8,7 +8,7 @@ export default defineConfig({
         rollupOptions: {
       input: {
         main: resolve(__dirname, 'index.html'),
-        webgpuBenchmark: resolve(__dirname, 'webgpu-benchmark.html'),
+        voxelRenderBenchmark: resolve(__dirname, 'scripts/voxel-render-benchmark.html'),
      }
     }
    },
@@ -27,6 +27,13 @@ export default defineConfig({
   },
 
 server: {
-  allowedHosts: true
+  allowedHosts: true,
+  proxy: {
+    '/earth-tiles': {
+      target: 'https://edu.voxelearth.org',
+      changeOrigin: true,
+      rewrite: path => path.replace(/^\/earth-tiles/, ''),
+    },
+  },
 }
 })

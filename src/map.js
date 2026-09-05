@@ -14,18 +14,25 @@ import {
 } from '3d-tiles-renderer/plugins';
 import { DRACOLoader } from 'three/examples/jsm/loaders/DRACOLoader.js';
 
-import { voxelizeModel, WEBGPU_WORKER_POOL_SIZE } from './voxelize-model.js';
+import { voxelizeModel, WEBGPU_WORKER_POOL_SIZE, invalidateSerializedModel } from './voxelize-model.js';
+import { VoxelLodCache, selectVoxelLod, projectedVoxelDemand } from './voxel-lod.js';
+import { setPackedVoxelTextures } from './packed-voxel-renderer.js';
+import { fetchEarthResource } from './earth-fetch.js';
+import { downloadExport } from './voxel-export.js';
+import { initializeMobileUI, mobileDevice, renderPixelRatio } from './mobile-ui.js';
+import './mobile.css';
 import {
   initBlockData,
   assignVoxelsToBlocks,
   applyAtlasToExistingVoxelMesh,
   restoreVoxelOriginalMaterial,
   setMinecraftBrightnessBias,
-  getMinecraftBrightnessBias
+  getMinecraftBrightnessBias,
+  getPackedBlockResources
 } from './assignToBlocksForGLB.js';
 import { SingleSceneViewer } from './SingleSceneViewer.js';
 import { SingleSceneFetcher } from './SingleSceneFetcher.js';
-import { getActiveServerUrl, isLocalServer } from './config.js';
+import { getActiveServerUrl, isLocalServer, resolveEarthTileUrl } from './config.js';
 
 const LEGACY_SRGB_ENCODING = 3001;
 const SESSION_MAX_AGE_MS = 2.5 * 60 * 60 * 1000;
@@ -71,7 +78,7 @@ if (typeof window !== 'undefined' && window.__photorealSession?.id) {
   window.fetch = async (input, opts = {}) => {
     if (!isTiles(input)) return realFetch(input, opts);
 
-    let response = await realFetch(input, opts);
+    let response = await fetchEarthResource(input, opts, realFetch);
     if (response && (response.status === 400 || response.status === 401 || response.status === 403)) {
       try {
         const raw = typeof input === 'string' ? input : (input?.url ?? String(input));
@@ -241,8 +248,7 @@ class HUD {
     return Math.max(8, Math.min(1024, val));
   }
 
-  /** Mirror global Vox/Minecraft state into Single Scene.
-   *  Rebuild when MC turns on so atlas bakes pre-transform (no grey / misalign). */
+  /** Texture switches share packed geometry; only density/rotation rebuild it. */
   async syncSingleSceneToGlobalVoxState(forceRebuild = false) {
     const viewer = window.singleSceneViewer;
     const container = viewer?.tilesContainer;
@@ -254,28 +260,8 @@ class HUD {
     const vox = container.getObjectByName('singleSceneVoxels');
     const res = this.getSingleSceneRes();
 
-    if (!state.vox) {
-      if (vox) {
-        try { restoreVoxelOriginalMaterial(vox); vox.userData.__mcApplied = false; } catch { }
-      }
-      return;
-    }
-
-    // Voxels ON
-    if (!vox) {
-      await this._rebuildSingleSceneVoxels(res); // pre-bakes MC if state.mc
-      return;
-    }
-
-    if (state.mc) {
-      // Always rebuild when MC is enabled to bake in the correct frame
-      if (forceRebuild || !vox.userData.__mcApplied) {
-        await this._rebuildSingleSceneVoxels(res);
-      }
-    } else {
-      // MC off → restore vertex colors; keep geometry
-      try { restoreVoxelOriginalMaterial(vox); vox.userData.__mcApplied = false; } catch { }
-    }
+    if (state.vox && (!vox || forceRebuild)) await this._rebuildSingleSceneVoxels(res);
+    await viewer.setMinecraftEnabled(state.mc);
   }
 
   _initializeModelPicker() {
@@ -339,6 +325,7 @@ class HUD {
       // Hide the main 3D tiles and show single scene interface
       this.setStatus('Single Scene Mode - Ready');
       singleScenePanel.classList.remove('hidden');
+      document.body.classList.add('single-scene-active');
       this._scheduleMiniMapInvalidate?.();
 
       // Update model picker button text
@@ -351,9 +338,12 @@ class HUD {
 
       // Clean up existing tiles if any
       if (window.tiles) {
+        for (const tile of [...window.tiles.group.children]) cleanupTileVoxels(tile);
+        voxelLodCache.clear();
         scene.remove(window.tiles.group);
         window.tiles.dispose();
         window.tiles = null;
+        tiles = null;
       }
 
       // Initialize single scene viewer with empty scene immediately
@@ -364,6 +354,7 @@ class HUD {
     } else {
       // Switch back to voxel earth mode
       singleScenePanel.classList.add('hidden');
+      document.body.classList.remove('single-scene-active');
       this.setStatus('Voxel Earth Mode');
 
       // Update model picker button text
@@ -677,15 +668,20 @@ class HUD {
     // Global Export GLB button (exports whatever is currently visible)
     const exportGlbBtn = document.getElementById('export-glb-btn');
     if (exportGlbBtn) {
-      exportGlbBtn.addEventListener('click', () => {
+      exportGlbBtn.addEventListener('click', async () => {
         if (exportGlbBtn.disabled) {
           this._logSingleScene?.('Confirm the export requirements first.');
           return;
         }
         // Prefer Single Scene if active, else main viewer
         if (window.singleSceneViewer && window.singleSceneViewer.scene) {
-          window.singleSceneViewer.generateCombineGltf();
-          this._logSingleScene?.('Export started (Single Scene)...');
+          exportGlbBtn.disabled = true;
+          exportGlbBtn.textContent = 'Preparing GLB…';
+          try {
+            await window.singleSceneViewer.generateCombineGltf();
+            this._logSingleScene?.('GLB exported');
+          } catch (error) { this._logSingleScene?.(`Export failed: ${error.message}`); }
+          finally { exportGlbBtn.textContent = 'Export Current Scene as GLB'; applyComplianceState(); }
         } else if (window.viewer && window.viewer.scene) {
           // If you have a main viewer, call its export method here
           window.viewer.generateCombineGltf?.();
@@ -747,42 +743,20 @@ class HUD {
         return;
       }
       const viewer = window.singleSceneViewer;
-      const vgrid = viewer?.voxelizer?._voxelGridRebased || viewer?.voxelizer?._voxelGrid;
+      const vgrid = viewer?.voxelizer?._voxelGrid;
       if (!viewer || !vgrid) { this._logSingleScene('❌ No voxel grid to export'); return; }
 
       try {
-        const mod = await import('./assignToBlocksForGLB.js');
-        await ensureMinecraftReady();          // map.js helper (already in your file)
-        await mod.initBlockData?.();           // extra guard; no-op if already ready
-        const dense = mod.buildBlockGrid(vgrid); // palette + dense indices
+        exportBtn.disabled = true;
+        exportBtn.textContent = 'Preparing…';
         const fmt = exportFmt.value;
-        if (fmt === 'mcfunction') {
-          const txt = mod.generateMcfunction(dense, { x: 0, y: 0, z: 0 });
-          downloadText('structure.mcfunction', txt);
-          this._logSingleScene('✅ Exported mcfunction');
-        } else if (fmt === 'nbt') {
-          const bytes = await mod.writeStructureNBT(dense, { dataVersion: 3955 });
-          const a = document.createElement('a');
-          a.href = URL.createObjectURL(new Blob([bytes], { type: 'application/octet-stream' }));
-          a.download = 'structure.nbt'; a.click(); setTimeout(() => URL.revokeObjectURL(a.href), 250);
-          this._logSingleScene('✅ Exported Structure .nbt');
-        } else if (fmt === 'schem') {
-          const bytes = await mod.writeSpongeSchem(dense, { mcVersion: '1.20' });
-          const a = document.createElement('a');
-          a.href = URL.createObjectURL(new Blob([bytes], { type: 'application/octet-stream' }));
-          a.download = 'structure.schem'; a.click(); setTimeout(() => URL.revokeObjectURL(a.href), 250);
-          this._logSingleScene('✅ Exported .schem');
-        } else if (fmt === 'schematic') {
-          const bytes = await mod.writeMCEditSchematic(dense);
-          const a = document.createElement('a');
-          a.href = URL.createObjectURL(new Blob([bytes], { type: 'application/octet-stream' }));
-          a.download = 'structure.schematic'; a.click(); setTimeout(() => URL.revokeObjectURL(a.href), 250);
-          this._logSingleScene('✅ Exported legacy .schematic');
-        }
+        const bytes = await viewer.exportSession.run(vgrid, fmt, text => this._logSingleScene(text));
+        downloadExport(bytes, `structure.${fmt}`);
+        this._logSingleScene(`Exported .${fmt}`);
       } catch (e) {
         console.error(e);
         this._logSingleScene('❌ Export failed');
-      }
+      } finally { exportBtn.textContent = 'Export'; applyComplianceState(); }
     });
 
     // No duplicate toggle handler — visibility logic handled by the single toggle above
@@ -899,7 +873,7 @@ class HUD {
     const vox = container.getObjectByName('singleSceneVoxels');
     container.children.forEach(ch => {
       if (vox && ch === vox) ch.visible = !!showVoxels;
-      else ch.visible = !showVoxels;
+      else ch.visible = !showVoxels || !vox;
     });
   }
 
@@ -912,30 +886,21 @@ class HUD {
     this._ssVoxVersion = (this._ssVoxVersion ?? 0) + 1;
     const myVersion = this._ssVoxVersion;
 
-    // Remove old voxels
+    viewer._voxelController?.terminate();
+    // Keep the previous preview until the replacement is ready. Serialize only
+    // original sources, never the packed preview attached alongside them.
     const old = container.getObjectByName('singleSceneVoxels');
-    if (old) {
-      old.traverse(n => {
-        if (n.isMesh) {
-          n.geometry?.dispose();
-          (Array.isArray(n.material) ? n.material : [n.material]).forEach(m => m?.dispose?.());
-        }
-      });
-      container.remove(old);
-      const i = viewer.voxelMeshes.indexOf(old);
-      if (i >= 0) viewer.voxelMeshes.splice(i, 1);
-    }
-
-    // Show originals while rebuilding
-    container.children.forEach(ch => { if (ch.name !== 'singleSceneVoxels') ch.visible = true; });
-
     container.updateMatrixWorld(true);
-    const containerBox = new THREE.Box3().setFromObject(container);
+    const source = new THREE.Group();
+    source.matrix.copy(container.matrixWorld); source.matrixAutoUpdate = false;
+    for (const child of container.children) if (child !== old) source.add(child.clone(true));
+    source.updateMatrixWorld(true);
+    const containerBox = new THREE.Box3().setFromObject(source);
     const containerSize = containerBox.getSize(new THREE.Vector3());
     const maxDim = Math.max(containerSize.x, containerSize.y, containerSize.z, 1);
 
     const childDiags = [];
-    for (const child of container.children) {
+    for (const child of source.children) {
       if (!child || child.name === 'singleSceneVoxels') continue;
       const box = new THREE.Box3().setFromObject(child);
       if (box.isEmpty()) continue;
@@ -954,11 +919,14 @@ class HUD {
     let vox;
     try {
       vox = await voxelizeModel({
-        model: container,
+        model: source,
         renderer: viewer.renderer,
         scene: viewer.scene,
         resolution: computedResolution,
         needGrid: true,
+        renderMode: 'packed',
+        method: getActiveVoxelMethod(),
+        onStart: controller => { viewer._voxelController = controller; },
         preRotateYDeg: rotDeg
       });
     } catch (e) {
@@ -973,7 +941,7 @@ class HUD {
       this._logSingleScene(vox.stats.dispatchReason);
     }
 
-    if (myVersion !== this._ssVoxVersion) {
+    if (myVersion !== this._ssVoxVersion || viewer.destroyed || viewer.tilesContainer !== container) {
       // stale
       vox?.voxelMesh?.traverse(n => {
         if (n.isMesh) { n.geometry?.dispose(); (Array.isArray(n.material) ? n.material : [n.material]).forEach(m => m?.dispose?.()); }
@@ -991,22 +959,6 @@ class HUD {
     // Preserve original vertex-color material BEFORE any MC swap
     voxelMesh.traverse(n => { if (n.isMesh && !n.userData.origMat) n.userData.origMat = n.material; });
 
-    // If MC is on, bake atlas NOW while the mesh & grid still share a frame
-    const wantMC = !!(typeof state === 'object' ? state.mc : (window.state && window.state.mc));
-    if (wantMC && rawGrid) {
-      try {
-        await ensureMinecraftReady();
-        voxelMesh.userData.__mcAllowApply = true;
-        await applyAtlasToExistingVoxelMesh(voxelMesh, rawGrid);
-        voxelMesh.userData.__mcApplied = true;
-      } catch (e) {
-        console.warn('MC apply (pre-transform) failed:', e);
-      }
-    } else {
-      // keep vertex-color material
-      voxelMesh.traverse(n => { if (n.isMesh) n.material = n.userData.origMat; });
-    }
-
     // Prepare counter-rotation so only sampling orientation changes
     const pivot = containerBox.getCenter(new THREE.Vector3());
     const Tneg = new THREE.Matrix4().makeTranslation(-pivot.x, -pivot.y, -pivot.z);
@@ -1018,41 +970,22 @@ class HUD {
     const inv = new THREE.Matrix4().copy(container.matrixWorld).invert();
     // Combined matrix that we apply to geometry; use same to rebase voxelGrid
     const Mreb = new THREE.Matrix4().multiplyMatrices(inv, counterM);
-    voxelMesh.traverse(node => {
-      if (node.isMesh && node.geometry) {
-        if (rotDeg !== 0) node.geometry.applyMatrix4(counterM); // undo visual rotation
-        node.geometry.applyMatrix4(inv);
-        node.position.set(0, 0, 0);
-        node.rotation.set(0, 0, 0);
-        node.scale.set(1, 1, 1);
-        node.updateMatrix();
-        node.frustumCulled = false;
-        try {
-          node.geometry.computeBoundingBox?.();
-          node.geometry.computeBoundingSphere?.();
-        } catch { }
-        try { node.layers.set(1); } catch { }
-      }
-    });
+    voxelMesh.applyMatrix4(Mreb);
+    voxelMesh.traverse(node => node.layers.set(1));
 
     voxelMesh.matrixAutoUpdate = false;
     voxelMesh.name = 'singleSceneVoxels';
     voxelMesh.userData.resolution = resolution;
     container.add(voxelMesh);
+    if (old) dispose(old);
+    viewer.exportSession.dispose();
     // Ensure transforms are up-to-date before any material/shader compilation
     try { container.updateMatrixWorld(true); } catch { }
     try { voxelMesh.updateMatrixWorld(true); } catch { }
     viewer.voxelMeshes = [voxelMesh];
     viewer.voxelizer = vox;
 
-    // Save a voxelGrid that matches the transformed geometry
-    try {
-      const rebasedGrid = rawGrid ? rebaseVoxelGrid(rawGrid, Mreb) : null;
-      viewer.voxelizer._voxelGridRebased = rebasedGrid;
-    } catch (e) {
-      console.warn('Failed to compute rebased voxelGrid:', e);
-      viewer.voxelizer._voxelGridRebased = rawGrid || null;
-    }
+    await viewer.setMinecraftEnabled(state.mc);
 
     // Materials already set earlier; no additional MC swap here
 
@@ -1207,7 +1140,7 @@ class HUD {
           if (this.toggleDebugImagery) this.toggleDebugImagery.checked = false;
         }
         updateVis();                          // main viewer
-        this.syncSingleSceneToGlobalVoxState(true);  // Single Scene mirrors global
+        this.syncSingleSceneToGlobalVoxState(false);
       });
     }
 
@@ -1215,7 +1148,7 @@ class HUD {
       this.toggleMC.addEventListener('change', e => {
         state.mc = e.target.checked;
         updateVis();                          // main viewer
-        this.syncSingleSceneToGlobalVoxState(true);  // rebuild to pre-bake MC
+        this.syncSingleSceneToGlobalVoxState(false);
       });
     }
 
@@ -1779,6 +1712,7 @@ function initializeApp() {
   // Add a small delay to ensure all DOM elements are fully rendered
   setTimeout(() => {
     ui = new HUD();
+    initializeMobileUI();
 
     // Set up UI callbacks after UI is ready
     {
@@ -1847,20 +1781,6 @@ function isInteractionBusy() {
   return isInteracting || (performance.now() - lastInteractionAt) < INTERACTION_SETTLE_MS;
 }
 
-function waitForInteractionIdle() {
-  if (!isInteractionBusy()) return Promise.resolve();
-  return new Promise((resolve) => {
-    const tick = () => {
-      if (!isInteractionBusy()) {
-        resolve();
-        return;
-      }
-      setTimeout(tick, 40);
-    };
-    tick();
-  });
-}
-
 (() => {
   // Stable, zero-stutter baseline: WebGL. Re-enable WebGPU later if desired.
   renderer = new THREE.WebGLRenderer({
@@ -1902,7 +1822,8 @@ function resize() {
   const w = innerWidth, h = innerHeight;
   camera.aspect = w / h; camera.updateProjectionMatrix();
   renderer.setSize(w, h);
-  renderer.setPixelRatio(Math.min(1.25, window.devicePixelRatio));
+  renderer.setPixelRatio(renderPixelRatio());
+  tiles?.setResolutionFromRenderer(camera, renderer);
 }
 
 /* ───────────────────────────── TilesRenderer factory ──────────────── */
@@ -1926,6 +1847,9 @@ function ensureTiles(root, key) {
   if (tiles) {
     // If the root has changed, we must dispose of the old renderer and start fresh
     if (tiles._rootUrl === root) return;
+    for (const tile of [...tiles.group.children]) cleanupTileVoxels(tile);
+    voxelLodCache.clear();
+    pendingVoxelAttachments.clear();
     scene.remove(tiles.group);
     tiles.dispose();
     tiles = null;
@@ -1948,7 +1872,7 @@ function ensureTiles(root, key) {
     if (u.startsWith('blob:') || u.startsWith('data:')) return u;
 
     // Use the tileset's root URL as the base for relative URLs (important for local/custom servers)
-    const url = new URL(u, root);
+    const url = resolveEarthTileUrl(u, root);
 
     if (typeof window !== 'undefined' && window.__photorealSession?.id) {
       const shared = window.__photorealSession;
@@ -1994,23 +1918,15 @@ function ensureTiles(root, key) {
   // Events (no auto-framing here; 'load-tile-set' fires multiple times for nested sets)
   tiles.addEventListener('load-model', onTileLoad);
   tiles.addEventListener('dispose-model', onTileDispose);
-  // LOD visibility management
-  tiles.addEventListener('tile-visibility-change', ({ tile, scene: tileGroup, visible }) => {
+  tiles.addEventListener('tile-visibility-change', ({ scene: tileGroup, visible }) => {
     if (!tileGroup) return;
     tileGroup.userData.rendererVisible = visible;
-    if (visible) {
-      const needsVoxel = !tileGroup._voxMesh;
-      if (state.vox && !isInteractionBusy() && getVoxelizerBudget() > 0 && needsVoxel && !tileGroup._mcMesh && !voxelizingTiles.has(tileGroup) && !disposingTiles.has(tileGroup)) {
-        scheduleVoxel(() => buildVoxelFor(tileGroup));
-      }
-    } else {
-      try { tileGroup._voxWorker?.terminate?.(); } catch { }
-      voxelizingTiles.delete(tileGroup);
-      const pending = pendingVoxelAttachments.get(tileGroup);
-      if (pending?.voxelMesh) dispose(pending.voxelMesh);
-      pendingVoxelAttachments.delete(tileGroup);
+    voxelLodCache.setVisible(tileGroup, visible && state.vox);
+    if (!visible) {
+      cancelTileVoxelBuild(tileGroup);
       if (tileGroup._voxMesh) tileGroup._voxMesh.visible = false;
-      if (tileGroup._mcMesh) tileGroup._mcMesh.visible = false;
+    } else if (state.vox) {
+      scheduleTileVoxel(tileGroup);
     }
     applyVis(tileGroup);
   });
@@ -2021,6 +1937,9 @@ function ensureTiles(root, key) {
 
 function retargetTiles(latDeg, lonDeg) {
   if (!tiles) return;
+  // Hidden source tiles are detached from tiles.group but may have cached LODs
+  // and serialized world transforms. Retarget must invalidate those, too.
+  for (const tile of new Set([...tiles.group.children, ...voxelLodCache.tiles.keys()])) cleanupTileVoxels(tile);
   tiles.setLatLonToYUp(
     latDeg * THREE.MathUtils.DEG2RAD,
     lonDeg * THREE.MathUtils.DEG2RAD
@@ -2052,34 +1971,32 @@ function dispose(o) {
   if (!o) return;
   if (o.userData && o.userData.sourceTile) {
     const tile = o.userData.sourceTile;
-    if (tile._voxMesh === o) delete tile._voxMesh;
+    if (tile._voxMesh === o) {
+      delete tile._voxMesh;
+      delete tile._voxelizer;
+      delete tile._voxResolution;
+    }
     if (tile._mcMesh === o) delete tile._mcMesh;
     delete o.userData.sourceTile;
   }
 
+  const materials = new Set();
   if (o.traverse && typeof o.traverse === 'function') {
     o.traverse(n => {
       if (n.isMesh) {
         n.geometry?.dispose();
-        (Array.isArray(n.material) ? n.material : [n.material])
-          .forEach(m => {
-            if (m) {
-              m.map?.dispose();
-              m.dispose();
-            }
-          });
+        for (const material of [n.material, n.userData?.origMat, n.userData?.mcMat].flat()) {
+          if (material) materials.add(material);
+        }
       }
     });
   } else if (o.isMesh) {
     o.geometry?.dispose();
-    (Array.isArray(o.material) ? o.material : [o.material])
-      .forEach(m => {
-        if (m) {
-          m.map?.dispose();
-          m.dispose();
-        }
-      });
+    for (const material of [o.material].flat()) if (material) materials.add(material);
   }
+  // Minecraft materials borrow the shared atlas. Packed materials dispose their
+  // own private atlas through a dispose listener; do not free borrowed maps.
+  for (const material of materials) material.dispose();
   o.parent?.remove(o);
 }
 
@@ -2088,44 +2005,105 @@ function dispose(o) {
 const voxelizingTiles = new Set();
 const disposingTiles = new Set();
 const pendingVoxelAttachments = new Map();
+const scheduledVoxelTiles = new Set();
 let pendingVoxelFlushScheduled = false;
+let voxelQueueScheduled = false;
 
-// --- New: distance-aware resolution & concurrency budget ---
 const CPU = (navigator.hardwareConcurrency || 4);
-const MAX_CONCURRENT_VOXELIZERS = Math.max(1, Math.min(4, Math.floor(CPU / 2)));
+const MAX_CONCURRENT_VOXELIZERS = Math.max(1, Math.min(mobileDevice() ? 2 : 4, Math.floor(CPU / 2)));
 const WEBGPU_CONCURRENT_VOXELIZERS = WEBGPU_WORKER_POOL_SIZE;
-const TARGET_PX_PER_VOXEL = 3;     // tweak to taste (2..4 is a good band)
+const TARGET_PX_PER_VOXEL = 3;
+const sourceBoundsCache = new WeakMap();
+const worldVoxelSphere = new THREE.Sphere();
+let voxelSettingsRevision = 0;
+let packedMinecraftResources = null;
+let pendingMinecraftResources = null;
+const voxelLodCache = new VoxelLodCache({
+  maxBytes: (mobileDevice() ? 48 : 128) * 1024 * 1024,
+  maxLevelsPerTile: 3,
+  onDispose: vox => dispose(vox.voxelMesh),
+  onActivate: (tile, entry, previous) => {
+    const mesh = entry.result.voxelMesh;
+    mesh.userData.sourceTile = tile;
+    mesh.matrixAutoUpdate = false;
+    mesh.traverse(node => {
+      node.layers.set(LAYER_VOXELS);
+      if (node.isMesh && !node.userData.origMat) node.userData.origMat = node.material;
+    });
+    scene.add(mesh);
+    tile._voxMesh = mesh;
+    tile._voxelizer = entry.result;
+    tile._voxQuality = 'final';
+    tile._voxResolution = entry.resolution;
+    tile._mcApplied = !!mesh.userData.__mcApplied;
+    // Detach the old representation only after the replacement is attached.
+    if (previous && previous !== entry) previous.result.voxelMesh.removeFromParent();
+    delete tile._voxError;
+    applyVis(tile);
+  },
+});
+window.getVoxelLodStats = () => ({ ...voxelLodCache.stats(), sharedTextureBytes: (packedMinecraftResources?.lookup.image.data.byteLength ?? 0) + (packedMinecraftResources?.atlas.image.width ?? 0) * (packedMinecraftResources?.atlas.image.height ?? 0) * 4 });
+window.getVoxelRenderStats = () => ({ ...renderer.info.render, memory: { ...renderer.info.memory }, width: renderer.domElement.width, height: renderer.domElement.height });
+window.getVoxelCoverageStats = () => {
+  const visible = (tiles?.group.children ?? []).filter(tile => tile.userData.rendererVisible !== false);
+  const voxels = visible.filter(tile => tile._voxMesh?.visible && tile._voxMesh.children.length);
+  const fallback = visible.filter(tile => tile.visible && camera.layers.isEnabled(LAYER_IMAGERY));
+  return { visible: visible.length, voxels: voxels.length, fallback: fallback.length,
+    uncovered: visible.filter(tile => !voxels.includes(tile) && !fallback.includes(tile)).length,
+    queued: scheduledVoxelTiles.size, running: voxelizingTiles.size };
+};
 
-function screenRadiusForObject(obj) {
-  // estimate object radius in world units
-  const box = new THREE.Box3().setFromObject(obj);
-  const sphere = new THREE.Sphere();
-  box.getBoundingSphere(sphere);
+function voxelSignature() {
+  return JSON.stringify([voxelSettingsRevision, getActiveVoxelMethod()]);
+}
 
-  const dist = camera.position.distanceTo(sphere.center);
-  const vFov = THREE.MathUtils.degToRad(camera.fov);
-  const pxPerUnit = renderer.domElement.height / (2 * Math.tan(vFov / 2));
-  return (sphere.radius * pxPerUnit) / Math.max(1e-3, dist); // pixels
+function sourceBoundsFor(tile) {
+  let bounds = sourceBoundsCache.get(tile);
+  if (!bounds) {
+    tile.updateWorldMatrix(true, true);
+    const box = new THREE.Box3().setFromObject(tile);
+    box.applyMatrix4(new THREE.Matrix4().copy(tile.matrixWorld).invert());
+    const size = box.getSize(new THREE.Vector3());
+    bounds = { sphere: box.getBoundingSphere(new THREE.Sphere()), span: Math.max(size.x, size.y, size.z) };
+    sourceBoundsCache.set(tile, bounds);
+  }
+  tile.updateWorldMatrix(true, false);
+  worldVoxelSphere.copy(bounds.sphere).applyMatrix4(tile.matrixWorld);
+  return { sphere: worldVoxelSphere, span: bounds.span * tile.matrixWorld.getMaxScaleOnAxis() };
+}
+
+function screenRadiusForObject(tile) {
+  const { sphere } = sourceBoundsFor(tile);
+  return projectedVoxelDemand(sphere.radius, camera.position.distanceTo(sphere.center),
+    renderer.domElement.height, camera.fov, 1);
 }
 
 function resolutionForTile(tile) {
-  const pxRadius = screenRadiusForObject(tile);
-  // translate pixels → voxels; clamp to GUI slider as an upper bound
-  const r = Math.round(pxRadius / TARGET_PX_PER_VOXEL);
-  return THREE.MathUtils.clamp(r, 8, state.resolution);
+  const { sphere, span } = sourceBoundsFor(tile);
+  const demand = projectedVoxelDemand(span, camera.position.distanceTo(sphere.center),
+    renderer.domElement.height, camera.fov, TARGET_PX_PER_VOXEL);
+  const current = voxelLodCache.current(tile);
+  const pending = voxelLodCache.pending(tile);
+  return selectVoxelLod(demand, state.resolution, pending?.resolution ?? current?.resolution);
 }
 
-// Only bother voxelizing if the tile is at least a couple pixels on-screen
-function isWorthVoxelizing(tile) {
-  try {
-    return screenRadiusForObject(tile) > 2;
-  } catch {
-    return true; // be permissive on failure
-  }
+function isWorthVoxelizing(tile) { return screenRadiusForObject(tile) > 2; }
+
+function needsVoxelUpdate(tile) {
+  const resolution = resolutionForTile(tile), signature = voxelSignature();
+  const pending = voxelLodCache.pending(tile);
+  if (pending?.resolution === resolution && pending.signature === signature) return false;
+  const current = voxelLodCache.current(tile);
+  return !current || current.resolution !== resolution || current.signature !== signature;
 }
 
-function nextFrame() {
-  return new Promise((resolve) => requestAnimationFrame(() => resolve()));
+function cancelTileVoxelBuild(tile) {
+  scheduledVoxelTiles.delete(tile);
+  voxelLodCache.cancel(tile);
+  pendingVoxelAttachments.delete(tile);
+  voxelizingTiles.delete(tile);
+  delete tile._voxBuildToken;
+  delete tile._voxWorker;
 }
 
 function getActiveVoxelMethod() {
@@ -2144,340 +2122,219 @@ function getVoxelizerBudget() {
   return Math.max(0, maxConcurrent - voxelizingTiles.size);
 }
 
-function scheduleVoxel(cb) {
-  const run = () => {
-    if (isInteractionBusy()) {
-      const waitMs = Math.max(40, INTERACTION_SETTLE_MS - (performance.now() - lastInteractionAt));
-      setTimeout(run, waitMs);
-      return;
-    }
-    if ('requestIdleCallback' in window) {
-      requestIdleCallback(() => {
-        if (isInteractionBusy()) {
-          scheduleVoxel(cb);
-          return;
-        }
-        cb();
-      }, { timeout: 120 });
-      return;
-    }
-    setTimeout(() => {
-      if (isInteractionBusy()) {
-        scheduleVoxel(cb);
-        return;
-      }
-      cb();
-    }, 0);
-  };
-
-  run();
+function scheduleTileVoxel(tile) {
+  scheduledVoxelTiles.add(tile);
+  scheduleVoxelQueue();
 }
 
-async function finalizeVoxelAttach(tile, vox, { quality = 'final' } = {}) {
-  if (!tile || !vox) return;
-  if (isInteractionBusy()) {
-    pendingVoxelAttachments.set(tile, { vox, quality });
-    schedulePendingVoxelFlush();
-    return;
-  }
-  if (!tile.parent || tile.parent !== tiles.group || disposingTiles.has(tile)) {
-    dispose(vox.voxelMesh);
-    return;
-  }
-
-  const vMesh = vox.voxelMesh;
-  vMesh.matrixAutoUpdate = false;
-  vMesh.userData.sourceTile = tile;
-
-  vMesh.traverse(m => {
-    if (!m.isMesh) return;
-    const bb = m.geometry.boundingBox;
-    if (bb) {
-      const c = bb.getCenter(new THREE.Vector3());
-      m.renderOrder = -camera.position.distanceToSquared(c);
+function scheduleVoxelQueue() {
+  if (voxelQueueScheduled || !scheduledVoxelTiles.size) return;
+  voxelQueueScheduled = true;
+  requestAnimationFrame(() => {
+    voxelQueueScheduled = false;
+    const deadline = performance.now() + (isInteractionBusy() ? 2 : 4);
+    // Fill missing coverage first, then improve existing meshes; nearer tiles win.
+    const candidates = [...scheduledVoxelTiles].filter(tile => {
+      if (!state.vox || tile.parent !== tiles?.group || tile.userData.rendererVisible === false || disposingTiles.has(tile)) {
+        scheduledVoxelTiles.delete(tile); return false;
+      }
+      return true;
+    }).map(tile => ({ tile, ready: !!tile._voxMesh, distance: sourceBoundsFor(tile).sphere.center.distanceToSquared(camera.position) }))
+      .sort((a, b) => Number(a.ready) - Number(b.ready) || a.distance - b.distance);
+    for (const { tile } of candidates) {
+      const resolution = resolutionForTile(tile), signature = voxelSignature();
+      const cached = voxelLodCache.tiles.get(tile)?.levels.has(JSON.stringify([signature, resolution]));
+      if (!getVoxelizerBudget() && !cached) continue;
+      scheduledVoxelTiles.delete(tile);
+      void buildVoxelFor(tile);
+      if (performance.now() >= deadline) break;
     }
+    // A completed worker wakes a saturated queue; don't spin while all are busy.
+    if (getVoxelizerBudget()) scheduleVoxelQueue();
   });
-
-  vMesh.traverse(n => n.layers.set(LAYER_VOXELS));
-  if (quality === 'final' && tile._voxMesh && tile._voxMesh !== vMesh) {
-    dispose(tile._voxMesh);
-  }
-  scene.add(vMesh);
-
-  tile._voxMesh = vMesh;
-  tile._voxQuality = quality;
-  if (quality === 'final') {
-    tile._voxelizer = vox;
-  } else {
-    delete tile._voxelizer;
-    tile._mcApplied = false;
-  }
-  delete tile._voxWorker;
-  vMesh.traverse(n => { if (n.isMesh && !n.userData.origMat) n.userData.origMat = n.material; });
-
-  if (quality === 'final' && state.mc && vox._voxelGrid) {
-    vMesh.userData.__mcAllowApply = true;
-    await buildMinecraftFor(tile);
-  }
-  applyVis(tile);
 }
 
 function schedulePendingVoxelFlush() {
   if (pendingVoxelFlushScheduled) return;
   pendingVoxelFlushScheduled = true;
-  setTimeout(async () => {
+  setTimeout(() => {
     pendingVoxelFlushScheduled = false;
-    await flushPendingVoxelAttachments();
+    flushPendingVoxelAttachments();
   }, 0);
 }
 
-async function flushPendingVoxelAttachments() {
-  if (isInteractionBusy() || !pendingVoxelAttachments.size) return;
-  const entries = Array.from(pendingVoxelAttachments.entries());
-  for (const [tile, pending] of entries) {
-    if (isInteractionBusy()) {
-      schedulePendingVoxelFlush();
-      return;
-    }
+function flushPendingVoxelAttachments() {
+  const deadline = performance.now() + 4;
+  for (const [tile, token] of pendingVoxelAttachments) {
     pendingVoxelAttachments.delete(tile);
-    await finalizeVoxelAttach(tile, pending.vox, pending);
-    await nextFrame();
+    // A tile can become hidden or change settings while the result waits.
+    if (tile.parent !== tiles?.group || !state.vox || tile.userData.rendererVisible === false
+      || voxelSignature() !== token.signature || resolutionForTile(tile) !== token.resolution) {
+      if (voxelLodCache.pending(tile) === token) cancelTileVoxelBuild(tile);
+      continue;
+    }
+    voxelLodCache.commit(token);
+    if (performance.now() >= deadline) { schedulePendingVoxelFlush(); break; }
   }
 }
 
-async function buildVoxelFor(tile, { quality = null } = {}) {
-  const rendererVisible = tile?.userData?.rendererVisible;
-  const activeMethod = getActiveVoxelMethod();
-  const requestedQuality = quality ?? 'final';
-  if (!tile || tile._voxError || voxelizingTiles.has(tile) || disposingTiles.has(tile)) return;
-  if (rendererVisible === false) return; // only skip when we know it's hidden
-  if (!tile.parent || tile.parent !== tiles.group) return;
-  if (getVoxelizerBudget() <= 0) return;
-  if (tile._voxPendingQuality === requestedQuality) return;
-  if (requestedQuality === 'final' && tile._voxQuality === 'final') return;
-
-  let hasMeshes = false;
-  tile.traverse(n => { if (n.isMesh && n.geometry) hasMeshes = true; });
-  if (!hasMeshes) return;
-
-  // Skip giant parent tiles when we're close (they'll refine into children)
-  const s = new THREE.Sphere();
-  tile.getWorldPosition(s.center);
-  tile.getWorldScale(s);           // crude scale proxy
-  const approxRadius = tile.boundingSphere?.radius || Math.max(s.x, s.y, s.z) * 50;
-  const dist2 = camera.position.distanceToSquared(s.center);
-  if (approxRadius * approxRadius > dist2 * 0.3) return;
-
+async function buildVoxelFor(tile) {
+  if (!tile || !state.vox || tile.parent !== tiles?.group || tile.userData.rendererVisible === false
+    || disposingTiles.has(tile) || !isWorthVoxelizing(tile)) return;
+  const resolution = resolutionForTile(tile), signature = voxelSignature();
+  if (tile._voxError?.key === JSON.stringify([signature, resolution]) && performance.now() < tile._voxError.retryAt) return;
+  // Superseded jobs must release their concurrency slot before a replacement starts.
+  const pending = voxelLodCache.pending(tile);
+  if (pending && (pending.resolution !== resolution || pending.signature !== signature)) cancelTileVoxelBuild(tile);
+  voxelLodCache.setVisible(tile, true);
+  const request = voxelLodCache.request(tile, resolution, signature, { allowBuild: getVoxelizerBudget() > 0 });
+  if (request.status !== 'build') return;
+  const token = request.token;
+  tile._voxBuildToken = token;
   voxelizingTiles.add(tile);
-  tile._voxPendingQuality = requestedQuality;
+  let vox = null;
   try {
-    const perTileResolution = resolutionForTile(tile);
-    let workerRef = null;
-    const vox = await voxelizeModel({
-      model: tile,
-      renderer,
-      resolution: perTileResolution,
-      needGrid: !!state.mc,
-      method: activeMethod,
-      renderMode: activeMethod === 'webgpu' && !state.mc ? 'instances' : 'mesh',
-      onStart: w => { workerRef = w; tile._voxWorker = w; },
-      mainThreadPolicy: {
-        shouldPause: () => isInteractionBusy(),
-        waitForIdle: waitForInteractionIdle,
-      }
+    vox = await voxelizeModel({
+      model: tile, renderer, resolution, needGrid: false,
+      method: getActiveVoxelMethod(), renderMode: 'packed',
+      onStart: controller => {
+        voxelLodCache.setController(token, controller);
+        if (voxelLodCache.isCurrent(token)) tile._voxWorker = controller;
+      },
+      // Packed reconstruction already yields every 4 ms. Do not stall it for an
+      // entire drag: finished geometry can replace source coverage while moving.
     });
-
-    if (vox?.stats?.fallbackReason) {
-      console.warn(vox.stats.fallbackReason);
-    }
-    if (!tile.parent || tile.parent !== tiles.group || disposingTiles.has(tile)) {
-      try { workerRef?.terminate?.(); } catch { }
-      dispose(vox.voxelMesh);
+    if (vox.stats?.fallbackReason) console.warn(vox.stats.fallbackReason);
+    if (!voxelLodCache.isCurrent(token) || tile.parent !== tiles?.group || signature !== voxelSignature()) {
+      dispose(vox.voxelMesh); vox = null;
+      voxelLodCache.fail(token);
       return;
     }
-    await finalizeVoxelAttach(tile, vox, { quality: requestedQuality });
-  } catch (e) {
-    if (e?.message === 'Voxelization cancelled') return;
-    console.warn('voxelise failed', e);
-    tile._voxError = true; // prevent infinite retry spam this session
+    const accepted = voxelLodCache.stage(token, vox);
+    vox = null; // Cache owns the result (or has already disposed stale output).
+    if (accepted) {
+      pendingVoxelAttachments.set(tile, token);
+      flushPendingVoxelAttachments();
+      if (pendingVoxelAttachments.size) schedulePendingVoxelFlush();
+    }
+  } catch (error) {
+    if (vox) dispose(vox.voxelMesh);
+    if (voxelLodCache.isCurrent(token) && error?.message !== 'Voxelization cancelled') {
+      tile._voxError = { key: token.key, retryAt: performance.now() + 5000 };
+      console.warn('Voxel LOD build failed; retaining previous mesh:', error);
+    }
+    voxelLodCache.fail(token);
   } finally {
-    if (tile._voxPendingQuality === requestedQuality) delete tile._voxPendingQuality;
-    voxelizingTiles.delete(tile);
+    if (tile._voxBuildToken === token) {
+      delete tile._voxBuildToken;
+      delete tile._voxWorker;
+      voxelizingTiles.delete(tile);
+    }
+    scheduleVoxelQueue();
   }
-}
-
-async function buildMinecraftFor(tile) {
-  // Backwards-compat helper: apply atlas material if not already applied
-  if (!tile || !tile._voxMesh || !tile._voxelizer || disposingTiles.has(tile)) return;
-  if (tile._mcApplied) return;
-  if (isInteractionBusy()) {
-    scheduleVoxel(() => buildMinecraftFor(tile));
-    return;
-  }
-  if (tile._voxMesh.userData?.renderMode === 'instanced-voxels') {
-    cleanupTileVoxels(tile);
-    await buildVoxelFor(tile);
-    return;
-  }
-  if (!tile._voxelizer._voxelGrid) {
-    cleanupTileVoxels(tile);
-    await buildVoxelFor(tile);
-    return;
-  }
-  try {
-    await applyAtlasToExistingVoxelMesh(tile._voxMesh, tile._voxelizer._voxelGrid);
-    tile._mcApplied = true;
-    applyVis(tile);
-  } catch (e) { console.warn('Minecraft material swap failed', e); }
 }
 
 // The 'scene' from the event is the THREE.Group for the tile.
 function onTileLoad({ scene: tile }) {
-  if (!tile || !tile.parent || tile.parent !== tiles.group || tile.type !== 'Group') return;
+  if (!tile || tile.parent !== tiles?.group || tile.type !== 'Group') return;
   tile.updateMatrixWorld(true);
-
-  // All original meshes live on the imagery layer
-  tile.traverse(n => n.layers.set(LAYER_IMAGERY));
-
-  // The complex 'cleanupOverlappingVoxels' is no longer needed.
-  // The 'tile-visibility-change' event now handles removing voxels from
-  // parent tiles when children (higher LODs) are loaded.
-  applyVis(tile);
-  // If we don't yet know visibility, assume visible so idle sweep can pick it up.
+  tile.traverse(node => node.layers.set(LAYER_IMAGERY));
   if (tile.userData.rendererVisible === undefined) tile.userData.rendererVisible = true;
-
-  // Automatically voxelize if vox mode is on.
-  const rendererVisible = tile?.userData?.rendererVisible;
-  const needsVoxel = !tile._voxMesh;
-  if (state.vox && !isInteractionBusy() && getVoxelizerBudget() > 0 && rendererVisible !== false && needsVoxel && !tile._voxError && !voxelizingTiles.has(tile)) {
-    scheduleVoxel(() => {
-      const stillVisible = tile?.userData?.rendererVisible;
-      const stillNeedsVoxel = !tile._voxMesh;
-      if (!isInteractionBusy() && tile.parent && stillVisible !== false && stillNeedsVoxel && !tile._voxError && !voxelizingTiles.has(tile) && !disposingTiles.has(tile) && isWorthVoxelizing(tile)) {
-        buildVoxelFor(tile);
-      }
-    });
-  }
+  voxelLodCache.setVisible(tile, state.vox && tile.userData.rendererVisible !== false);
+  applyVis(tile);
+  if (state.vox) scheduleTileVoxel(tile);
 }
 
-// The 'scene' from the event is the THREE.Group for the tile.
-function onTileDispose({ scene: tile }) {
-  if (tile) {
-    disposingTiles.add(tile);
-    cleanupTileVoxels(tile);
-    disposingTiles.delete(tile);
-  }
-}
+function onTileDispose({ scene: tile }) { if (tile) cleanupTileVoxels(tile); }
 
 function cleanupTileVoxels(tile) {
   if (!tile) return;
-
   disposingTiles.add(tile);
   try {
-    try { tile._voxWorker?.terminate?.(); } catch { }
+    cancelTileVoxelBuild(tile);
+    voxelLodCache.remove(tile);
     dispose(tile._voxMesh);
     dispose(tile._tempContainer);
-    const pending = pendingVoxelAttachments.get(tile);
-    if (pending?.vox?.voxelMesh) dispose(pending.vox.voxelMesh);
-    pendingVoxelAttachments.delete(tile);
-
-    voxelizingTiles.delete(tile);
-
-    delete tile._voxMesh;
-    delete tile._voxQuality;
-    delete tile._voxPendingQuality;
-    delete tile._voxelizer;
-    delete tile._tempContainer;
-    delete tile._voxError;  // allow retry after cleanup
-    delete tile._voxWorker;
-    delete tile._mcApplied;
-  } finally {
-    disposingTiles.delete(tile);
-  }
+    sourceBoundsCache.delete(tile);
+    invalidateSerializedModel(tile);
+    for (const key of ['_voxMesh', '_voxQuality', '_voxResolution', '_voxelizer', '_tempContainer', '_voxError', '_mcApplied']) delete tile[key];
+  } finally { disposingTiles.delete(tile); }
 }
-
-
 
 function applyVis(tile) {
   if (!tile || !tile.parent || tile.parent !== tiles.group || typeof tile.type !== 'string') return;
 
-  const showVoxels = state.vox;
-  const useMinecraft = state.vox && state.mc;
-  const hideImagery = state.vox && (state.debugImagery === false);
+  // Source tiles provide coverage until their individual voxel mesh is ready.
+  // Hiding the entire imagery layer creates holes during streaming/refinement.
+  camera.layers.enable(LAYER_IMAGERY);
+  if (state.vox) camera.layers.enable(LAYER_VOXELS); else camera.layers.disable(LAYER_VOXELS);
+  const hasVoxels = !!tile._voxMesh?.children.length;
+  tile.visible = tile.userData.rendererVisible !== false && (!state.vox || state.debugImagery || !hasVoxels);
 
-  if (hideImagery) {
-    camera.layers.disable(LAYER_IMAGERY);
-    camera.layers.enable(LAYER_VOXELS);
-  } else {
-    camera.layers.enable(LAYER_IMAGERY);
-    if (state.vox) camera.layers.enable(LAYER_VOXELS); else camera.layers.disable(LAYER_VOXELS);
-  }
-  tile.visible = tile.userData.rendererVisible !== false;
-
-  if (tile._voxMesh) tile._voxMesh.visible = !!showVoxels;
-  if (tile._voxMesh) tile._voxMesh.userData.__mcAllowApply = !!useMinecraft; // set gating flag
-
+  const visible = state.vox && tile.userData.rendererVisible !== false;
   if (tile._voxMesh) {
-    if (useMinecraft) {
-      // Lazy rebake only when MC ON and bias changed
-      if (tile._voxelizer?._voxelGrid) {
-        const wantBias = getMinecraftBrightnessBias?.();
-        if (typeof wantBias === 'number' && tile._voxMesh.userData.__mcBiasUsed !== wantBias && !tile._rebaking) {
-          tile._rebaking = true;
-          applyAtlasToExistingVoxelMesh(tile._voxMesh, tile._voxelizer._voxelGrid)
-            .then(() => { tile._mcApplied = true; })
-            .finally(() => { tile._rebaking = false; });
-        }
-      }
-      if (!tile._mcApplied && tile._voxelizer?._voxelGrid) {
-        buildMinecraftFor(tile);
-      } else {
-        tile._voxMesh.traverse(n => { if (n.isMesh && n.userData?.mcMat) n.material = n.userData.mcMat; });
-      }
-    } else {
-      tile._voxMesh.traverse(n => { if (n.isMesh && n.userData?.origMat) n.material = n.userData.origMat; });
-    }
+    tile._voxMesh.visible = visible;
+    setPackedVoxelTextures(tile._voxMesh, packedMinecraftResources, state.mc);
+    tile._mcApplied = !!tile._voxMesh.userData.__mcApplied;
   }
 }
 
-// Re-bake Minecraft atlas UVs on currently visible voxel tiles with a new brightness bias.
-// Pure CPU; no re-voxelization or new geometry. Exposed via window.MC_setBrightness.
+// Brightness replaces the shared block lookup without rebuilding voxel geometry.
 async function rebakeMinecraftUVsForVisibleTiles(bias = 0) {
   setMinecraftBrightnessBias(bias);
-  if (!tiles || !tiles.group) return;
-  if (!state.mc) { updateVis(); return; } // don't rebake when MC off; lazy on toggle
-  const kids = tiles.group.children || [];
-  for (const tile of kids) {
-    if (!tile || tile.type !== 'Group') continue;
-    if (!tile._voxMesh || !tile._voxelizer?._voxelGrid) continue;
-    tile._voxMesh.userData.__mcAllowApply = true;
-    try { await applyAtlasToExistingVoxelMesh(tile._voxMesh, tile._voxelizer._voxelGrid); tile._mcApplied = true; } catch (e) { console.warn('Rebake failed', e); }
-  }
   updateVis();
+  await window.singleSceneViewer?.setMinecraftEnabled(state.mc);
 }
-window.MC_setBrightness = (b) => rebakeMinecraftUVsForVisibleTiles(b);
+window.MC_setBrightness = b => rebakeMinecraftUVsForVisibleTiles(b);
 
-// Recompute per-tile visibility & (re)voxelization needs after UI state changes.
-// Called by UI event handlers when toggling vox / mc / debug imagery.
+function preparePackedMinecraft() {
+  const bias = getMinecraftBrightnessBias();
+  if (packedMinecraftResources?.bias === bias) {
+    // Returning to the active bias supersedes any unfinished replacement.
+    pendingMinecraftResources = null;
+    return;
+  }
+  if (pendingMinecraftResources?.bias === bias) return;
+  const request = { bias };
+  pendingMinecraftResources = request;
+  getPackedBlockResources(bias).then(resources => {
+    if (pendingMinecraftResources !== request) { resources.lookup.dispose(); return; }
+    const previous = packedMinecraftResources;
+    packedMinecraftResources = resources;
+    pendingMinecraftResources = null;
+    // Update every cached variant before disposing the previous shared lookup.
+    for (const tileState of voxelLodCache.tiles.values()) {
+      for (const entry of tileState.levels.values()) setPackedVoxelTextures(entry.result.voxelMesh, resources, state.mc);
+    }
+    previous?.lookup.dispose();
+    updateVis();
+  }).catch(error => {
+    if (pendingMinecraftResources === request) pendingMinecraftResources = null;
+    console.warn('Minecraft preview textures could not be prepared:', error);
+  });
+}
+
 function updateVis() {
-  if (!tiles || !tiles.group) return;
-  tiles.group.children.forEach(tile => { if (tile && tile.type === 'Group') applyVis(tile); });
+  if (state.mc) preparePackedMinecraft();
+  if (!tiles?.group) return;
+  for (const tile of tiles.group.children) {
+    if (tile?.type !== 'Group') continue;
+    const visible = state.vox && tile.userData.rendererVisible !== false;
+    voxelLodCache.setVisible(tile, visible);
+    if (!visible) cancelTileVoxelBuild(tile);
+    applyVis(tile);
+    if (visible) scheduleTileVoxel(tile);
+  }
 }
-
 
 function rebuildAll() {
-  if (!tiles || !tiles.group) return;
-
-  if (tiles.group.children) {
-    const tilesToClean = tiles.group.children.filter(child =>
-      child && (child._voxMesh || child._mcMesh)
-    );
-    tilesToClean.forEach(cleanupTileVoxels);
+  if (!tiles?.group) return;
+  voxelSettingsRevision++;
+  for (const tile of tiles.group.children) {
+    cancelTileVoxelBuild(tile);
+    voxelLodCache.invalidate(tile);
+    delete tile._voxError;
   }
-
-  voxelizingTiles.clear();
-  disposingTiles.clear();
-
   updateVis();
 }
 
@@ -2497,9 +2354,7 @@ function loop() {
   if (tiles) {
     camera.updateMatrixWorld();
     tiles.update();
-    if (!isInteractionBusy()) {
-      flushPendingVoxelAttachments();
-    }
+    flushPendingVoxelAttachments();
 
     // This periodic check is a good fallback to catch any visible tiles
     // that slipped through the event-based voxelization.
@@ -2511,34 +2366,24 @@ function loop() {
         const tilesToVoxelize = [];
         tiles.group.children.forEach(tile => {
           const rendererVisible = tile?.userData?.rendererVisible;
-          const needsVoxel = !tile._voxMesh;
+          const needsVoxel = tile?.type === 'Group' && needsVoxelUpdate(tile);
           if (tile && tile.type === 'Group'
             && rendererVisible !== false
             && isWorthVoxelizing(tile)
-            && needsVoxel && !tile._voxError
-            && !voxelizingTiles.has(tile) && !disposingTiles.has(tile)) {
-            tilesToVoxelize.push(tile);
+            && needsVoxel && !disposingTiles.has(tile)) {
+            tilesToVoxelize.push({ tile, distance: sourceBoundsFor(tile).sphere.center.distanceToSquared(camera.position) });
           }
         });
 
         if (tilesToVoxelize.length > 0) {
-          const camPos = camera.position;
-          tilesToVoxelize.sort((a, b) => {
-            const aPos = new THREE.Vector3();
-            const bPos = new THREE.Vector3();
-            a.getWorldPosition(aPos);
-            b.getWorldPosition(bPos);
-            return aPos.distanceToSquared(camPos) - bPos.distanceToSquared(camPos);
-          });
-
-          const budget = getVoxelizerBudget();
-          tilesToVoxelize.slice(0, budget).forEach(tile => scheduleVoxel(() => buildVoxelFor(tile)));
+          tilesToVoxelize.sort((a, b) => a.distance - b.distance);
+          tilesToVoxelize.forEach(({ tile }) => scheduleTileVoxel(tile));
         }
       }
     }
   }
 
-  renderer.render(scene, camera);
+  if (!window.singleSceneViewer && !document.hidden) renderer.render(scene, camera);
 }
 
 // Rebase a voxelGrid's bbox+unit by a 4x4 transform M (the SAME matrices applied to the voxel geometry).

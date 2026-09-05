@@ -3,7 +3,7 @@
 
 <head>
   <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no, maximum-scale=1.0">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
   <title>Voxel Earth Web</title>
   <meta name="description"
     content="Voxel Earth Web is an educational photogrammetry explorer that streams Google Photorealistic 3D Tiles, visualizes voxel workflows, and exports scenes directly from the browser.">
@@ -694,9 +694,12 @@
   <!-- Single Scene Panel (floating window) -->
   <div id="single-scene-panel" class="hidden fixed left-4 top-20 w-72 z-40 pointer-events-auto">
     <div class="glass elev rounded-2xl p-4 space-y-4 max-h-[calc(100vh-6rem)] overflow-y-auto single-scene-scroll">
-      <div class="mb-4">
+      <div class="mb-4 single-scene-heading flex items-center justify-between gap-2">
+        <div>
         <h2 class="text-sm font-semibold text-white mb-1">Single Scene Export</h2>
         <p class="text-xs text-white/60">Load and voxelize a specific area</p>
+        </div>
+        <button id="single-scene-panel-toggle" type="button" aria-expanded="true">Hide controls</button>
       </div>
 
       <!-- Controls -->

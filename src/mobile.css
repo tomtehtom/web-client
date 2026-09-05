@@ -1,0 +1,25 @@
+body > canvas { touch-action: none; }
+#single-scene-panel-toggle { display: none; }
+#single-scene-panel input, #single-scene-panel select { min-width: 0; }
+#single-scene-panel .single-scene-scroll { overscroll-behavior: contain; }
+@media (max-width: 768px), (pointer: coarse) {
+  button, select, input:not([type="checkbox"]):not([type="radio"]), label:has(input[type="checkbox"]) { min-height: 44px; }
+  input:not([type="range"]):not([type="checkbox"]), select { font-size: 16px !important; }
+  #single-scene-panel {
+    left: max(8px, env(safe-area-inset-left)); right: max(8px, env(safe-area-inset-right));
+    top: auto; bottom: max(8px, env(safe-area-inset-bottom)); width: auto;
+  }
+  #single-scene-panel .single-scene-scroll { max-height: 58dvh; padding: 12px; }
+  #single-scene-panel .single-scene-heading { position: sticky; top: -12px; padding: 8px 0; z-index: 5; background: #20282d; }
+  #single-scene-panel-toggle { display: block; flex: none; padding: 0 10px; font-size: 12px; white-space: nowrap; border-radius: 8px; background: #ffffff18; }
+  #single-scene-panel.is-collapsed .single-scene-heading ~ * { display: none; }
+  #single-scene-panel.is-collapsed .single-scene-heading { margin: 0; }
+  body.single-scene-active footer, body.single-scene-active #suggestions { display: none; }
+  .glass { backdrop-filter: blur(8px); }
+  #settings-menu > div > div, #voxel-methods-menu > div > div { max-height: 70dvh; overflow-y: auto; overscroll-behavior: contain; }
+  #model-picker-menu { max-width: calc(100vw - 24px); max-height: 70dvh; overflow-y: auto; }
+}
+@media (max-height: 500px) and (pointer: coarse) {
+  #single-scene-panel { right: auto; width: min(360px, 55vw); }
+  #single-scene-panel .single-scene-scroll { max-height: 68dvh; }
+}

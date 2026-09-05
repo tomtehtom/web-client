@@ -24,7 +24,23 @@ export function getActiveServerUrl(apiKey) {
         return CUSTOM_SERVER_URL;
     }
     const factory = TILE_SERVERS[ACTIVE_SERVER];
-    return factory ? factory(apiKey) : TILE_SERVERS.google(apiKey);
+    const url = factory ? factory(apiKey) : TILE_SERVERS.google(apiKey);
+    // The shared Earth endpoint does not allow localhost CORS. Vite forwards
+    // this same-origin development route; production keeps its configured URL.
+    if (import.meta.env?.DEV && ACTIVE_SERVER === 'custom' && !CUSTOM_SERVER_URL) {
+        return new URL('/earth-tiles/v1/3dtiles/root.json', window.location.origin).href;
+    }
+    return url;
+}
+
+export function resolveEarthTileUrl(value, root) {
+    const url = new URL(value, root);
+    const base = new URL(root);
+    if (base.pathname.startsWith('/earth-tiles/') && (url.origin === new URL(TILE_SERVERS.custom()).origin
+        || (url.origin === base.origin && url.pathname.startsWith('/v1/3dtiles/')))) {
+        return new URL('/earth-tiles' + url.pathname + url.search, base.origin);
+    }
+    return url;
 }
 
 export function isLocalServer() {

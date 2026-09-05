@@ -22,7 +22,7 @@ const TAG = {
 
 const enc = new TextEncoder();
 
-class ByteWriter {
+export class ByteWriter {
   constructor(initial = 1 << 16) {
     this.buffer = new Uint8Array(initial);
     this.length = 0;

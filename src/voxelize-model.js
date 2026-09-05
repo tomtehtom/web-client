@@ -1,4 +1,5 @@
 import * as THREE from 'three';
+import { createPackedVoxelMesh } from './packed-voxel-renderer.js';
 
 function nowMs() {
   if (typeof performance !== 'undefined' && typeof performance.now === 'function') {
@@ -18,6 +19,8 @@ function nextFrame() {
 }
 
 const SERIALIZED_MODEL_CACHE = new WeakMap();
+
+export function invalidateSerializedModel(model) { SERIALIZED_MODEL_CACHE.delete(model); }
 
 function clonePlain(value) {
   if (typeof structuredClone === 'function') return structuredClone(value);
@@ -151,7 +154,13 @@ export function serializeModel(model, { preRotateYDeg = 0, cache = true } = {}) 
     const g          = o.geometry;
     const attributes = {};
     for (const [name, attr] of Object.entries(g.attributes)) {
-      const clone = new (attr.array.constructor)(attr.array);
+      // GLTF may interleave attributes or normalize integer UVs/colors. Workers
+      // consume tightly packed numeric values, not GPU attribute metadata.
+      let clone;
+      if (attr.isInterleavedBufferAttribute || attr.normalized || attr.isFloat16BufferAttribute) {
+        clone = new Float32Array(attr.count * attr.itemSize);
+        for (let i = 0; i < attr.count; i++) for (let c = 0; c < attr.itemSize; c++) clone[i * attr.itemSize + c] = attr.getComponent(i, c);
+      } else clone = new (attr.array.constructor)(attr.array);
       attributes[name] = { array: clone, itemSize: attr.itemSize };
     }
 
@@ -379,27 +388,31 @@ function createDirectVoxelInstanceMesh(chunk) {
 
 async function rebuildWorkerGeometry(result, serializeStartedAt, workerPostedAt, workerCompletedAt, mainThreadPolicy = null) {
   const rebuildStartedAt = nowMs();
+  let rebuildDeadline = nowMs() + 4;
   if (mainThreadPolicy?.shouldPause?.()) {
     await (mainThreadPolicy.waitForIdle?.() ?? nextFrame());
   }
 
-  if (result.instanceChunks?.length) {
+  if (result.packedChunks?.length || result.instanceChunks?.length) {
+    const packed = !!result.packedChunks?.length;
+    const chunks = packed ? result.packedChunks : result.instanceChunks;
     const group = new THREE.Group();
-    group.userData.renderMode = 'instanced-voxels';
+    group.userData.renderMode = packed ? 'packed-surface' : 'instanced-voxels';
 
-    for (let chunkIndex = 0; chunkIndex < result.instanceChunks.length; chunkIndex++) {
-      if ((chunkIndex & 1) === 1) {
+    for (let chunkIndex = 0; chunkIndex < chunks.length; chunkIndex++) {
+      if (nowMs() >= rebuildDeadline || mainThreadPolicy?.shouldPause?.()) {
         if (mainThreadPolicy?.shouldPause?.()) {
           await (mainThreadPolicy.waitForIdle?.() ?? nextFrame());
         } else {
           await nextFrame();
         }
+        rebuildDeadline = nowMs() + 4;
       }
 
-      const chunk = result.instanceChunks[chunkIndex];
-      if (!chunk?.count) continue;
+      const chunk = chunks[chunkIndex];
+      if (!(packed ? chunk?.quadCount : chunk?.count)) continue;
 
-      const mesh = createDirectVoxelInstanceMesh(chunk);
+      const mesh = packed ? createPackedVoxelMesh(chunk) : createDirectVoxelInstanceMesh(chunk);
       group.add(mesh);
     }
 
@@ -408,24 +421,28 @@ async function rebuildWorkerGeometry(result, serializeStartedAt, workerPostedAt,
       voxelMesh: group,
       voxelCount: result.voxelCount,
       stats: {
+        ...(result.stats || {}),
+        workerComputeMs: result.stats?.totalMs,
         serializeMs: workerPostedAt - serializeStartedAt,
         workerMs: workerCompletedAt - workerPostedAt,
         rebuildMs: rebuildCompletedAt - rebuildStartedAt,
         totalMs: rebuildCompletedAt - serializeStartedAt,
-        ...(result.stats || {}),
       },
       _voxelGrid: hydrateVoxelGrid(result),
     };
   }
 
   const group = new THREE.Group();
+  group.userData.renderMode = result.stats?.renderMode ?? 'mesh';
+  const material = new THREE.MeshBasicMaterial({ vertexColors: true, toneMapped: false });
   for (let geometryIndex = 0; geometryIndex < result.geometries.length; geometryIndex++) {
-    if ((geometryIndex & 1) === 1) {
+    if (nowMs() >= rebuildDeadline || mainThreadPolicy?.shouldPause?.()) {
       if (mainThreadPolicy?.shouldPause?.()) {
         await (mainThreadPolicy.waitForIdle?.() ?? nextFrame());
       } else {
         await nextFrame();
       }
+      rebuildDeadline = nowMs() + 4;
     }
 
     const g = result.geometries[geometryIndex];
@@ -471,8 +488,10 @@ async function rebuildWorkerGeometry(result, serializeStartedAt, workerPostedAt,
 
     const mesh = new THREE.Mesh(
       geom,
-      new THREE.MeshBasicMaterial({ vertexColors: true, toneMapped: false })
+      material
     );
+    mesh.updateMatrix();
+    mesh.matrixAutoUpdate = false;
     if (g.bounds) {
       mesh.userData.chunkBounds = {
         min: new THREE.Vector3(g.bounds.min[0], g.bounds.min[1], g.bounds.min[2]),
@@ -487,11 +506,12 @@ async function rebuildWorkerGeometry(result, serializeStartedAt, workerPostedAt,
     voxelMesh: group,
     voxelCount: result.voxelCount,
     stats: {
+      ...(result.stats || {}),
+      workerComputeMs: result.stats?.totalMs,
       serializeMs: workerPostedAt - serializeStartedAt,
       workerMs: workerCompletedAt - workerPostedAt,
       rebuildMs: rebuildCompletedAt - rebuildStartedAt,
       totalMs: rebuildCompletedAt - serializeStartedAt,
-      ...(result.stats || {}),
     },
     _voxelGrid: hydrateVoxelGrid(result),
   };
@@ -511,7 +531,7 @@ let sharedWebGpuWorkerPool = null;
 function createSharedWebGpuWorkerSlot(index) {
   return {
     index,
-    worker: createVoxelWorker(),
+    worker: null,
     current: null,
     busy: false,
   };
@@ -544,7 +564,18 @@ function attachSharedWebGpuWorkerHandlers(pool, slot) {
       job.workerPostedAt,
       workerCompletedAt,
       job.mainThreadPolicy
-    ).then(job.resolve, job.reject).finally(() => {
+    ).then(value => {
+      if (job.controller.cancelled) {
+        const materials = new Set();
+        value.voxelMesh?.traverse(node => {
+          node.geometry?.dispose();
+          for (const material of [node.material].flat()) if (material) materials.add(material);
+        });
+        for (const material of materials) material.dispose();
+        return;
+      }
+      job.resolve(value);
+    }, job.reject).finally(() => {
       pumpSharedWebGpuWorkerQueue();
     });
   };
@@ -565,20 +596,16 @@ function getSharedWebGpuWorkerPool() {
       queue: [],
       slots: Array.from({ length: WEBGPU_WORKER_POOL_SIZE }, (_, index) => createSharedWebGpuWorkerSlot(index)),
     };
-    for (const slot of pool.slots) {
-      attachSharedWebGpuWorkerHandlers(pool, slot);
-    }
     sharedWebGpuWorkerPool = pool;
   }
   return sharedWebGpuWorkerPool;
 }
 
 function resetSharedWebGpuWorkerSlot(pool, slot) {
-  try { slot.worker.terminate(); } catch {}
-  slot.worker = createVoxelWorker();
+  try { slot.worker?.terminate(); } catch {}
+  slot.worker = null;
   slot.current = null;
   slot.busy = false;
-  attachSharedWebGpuWorkerHandlers(pool, slot);
   return slot;
 }
 
@@ -606,10 +633,18 @@ function pumpSharedWebGpuWorkerQueue() {
     slot.busy = true;
     slot.current = job;
     job.workerPostedAt = nowMs();
-    if (job.onStart) {
-      try { job.onStart(job.controller); } catch {}
+    try {
+      // Spawn only as much parallel capacity as is used. Keep successful workers
+      // warm; cancelled/error slots are replaced lazily by the next real job.
+      if (!slot.worker) {
+        slot.worker = createVoxelWorker();
+        attachSharedWebGpuWorkerHandlers(pool, slot);
+      }
+      slot.worker.postMessage(job.payload, job.transfers);
+    } catch (error) {
+      resetSharedWebGpuWorkerSlot(pool, slot);
+      job.reject(error);
     }
-    slot.worker.postMessage(job.payload, job.transfers);
   }
 }
 
@@ -646,6 +681,12 @@ function enqueueSharedWebGpuWorkerJob({ payload, transfers, onStart, serializeSt
       },
     };
 
+    // Expose cancellation while queued, too. Calling onStart inside dispatch
+    // could reset a slot and then post stale work into its replacement worker.
+    if (onStart) {
+      try { onStart(job.controller); } catch {}
+    }
+    if (job.controller.cancelled) return;
     pool.queue.push(job);
     pumpSharedWebGpuWorkerQueue();
   });
@@ -664,37 +705,15 @@ function voxelizeModelWithWorker({ model, serializedModel = null, resolution = 2
     });
     payload.imageDatas.forEach(([uuid, idata]) => transfers.push(idata.data.buffer));
 
-    if (method === 'webgpu') {
-      enqueueSharedWebGpuWorkerJob({
+    // Reuse workers for JS/WASM as well as WebGPU: repeated LOD builds keep
+    // their module/JIT/WASM startup warm and share one cancellable queue.
+    enqueueSharedWebGpuWorkerJob({
         payload: { modelData: payload, resolution, needGrid, method, renderMode },
         transfers,
         onStart,
         serializeStartedAt,
         mainThreadPolicy,
-      }).then(resolve, reject);
-      return;
-    }
-
-    let workerPostedAt = 0;
-    const worker = createVoxelWorker();
-    if (onStart) try { onStart(worker); } catch {}
-
-    worker.onmessage = e => {
-      const { status, result, message, stack } = e.data;
-      const workerCompletedAt = nowMs();
-      worker.terminate();
-
-      if (status === 'error') {
-        console.error('[voxelizer.worker] error:', message, stack);
-        return reject(new Error(message));
-      }
-      rebuildWorkerGeometry(result, serializeStartedAt, workerPostedAt, workerCompletedAt, mainThreadPolicy)
-        .then(resolve, reject);
-    };
-
-    worker.onerror = err => { worker.terminate(); reject(err); };
-    workerPostedAt = nowMs();
-    worker.postMessage({ modelData: payload, resolution, needGrid, method, renderMode }, transfers);
+    }).then(resolve, reject);
   });
 }
 
@@ -702,7 +721,7 @@ async function voxelizeModelWithWebGpu({ model, renderer, resolution = 200, need
   const serializedModel = serializeModel(model, { preRotateYDeg });
   const { useWebGpu, analysis } = shouldUseWebGpuForSerializedModel(serializedModel, resolution);
   const dispatchMethod = useWebGpu ? 'webgpu' : '2.5d-scan';
-  const dispatchRenderMode = !needGrid && renderMode === 'instances' ? 'instances' : 'mesh';
+  const dispatchRenderMode = needGrid ? 'mesh' : renderMode;
 
   const result = await voxelizeModelWithWorker({
     model,
@@ -738,6 +757,11 @@ async function voxelizeModelWithWebGpu({ model, renderer, resolution = 200, need
 }
 
 export async function voxelizeModel({ model, renderer = null, resolution = 200, needGrid = false, method = '2.5d-scan', renderMode = 'mesh', onStart, preRotateYDeg = 0, mainThreadPolicy = null }) {
+  // Packed shaders target WebGL2; Three's WebGPU renderer needs conventional
+  // geometry. Export grids can accompany either representation.
+  if (renderMode === 'packed' && renderer?.isWebGPURenderer) {
+    renderMode = 'surface';
+  }
   if (method === 'webgpu') {
     try {
       return await voxelizeModelWithWebGpu({ model, renderer, resolution, needGrid, method, renderMode, onStart, preRotateYDeg, mainThreadPolicy });
@@ -750,7 +774,7 @@ export async function voxelizeModel({ model, renderer = null, resolution = 200, 
         resolution,
         needGrid,
         method: '2.5d-scan',
-        renderMode: !needGrid && renderMode === 'instances' ? 'instances' : 'mesh',
+        renderMode: needGrid ? 'mesh' : renderMode,
         onStart,
         preRotateYDeg,
         mainThreadPolicy,

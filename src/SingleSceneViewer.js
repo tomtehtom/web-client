@@ -6,11 +6,17 @@ import { KTX2Loader }   from 'three/examples/jsm/loaders/KTX2Loader.js';
 import { MeshoptDecoder } from 'three/examples/jsm/libs/meshopt_decoder.module.js';
 import { GLTFExporter } from 'three/addons/exporters/GLTFExporter.js';
 import { loadGltfBatch } from './loadGltfBatch.js';
+import { VoxelExportSession, makeExportGroup, downloadExport } from './voxel-export.js';
+import { getPackedBlockResources, getMinecraftBrightnessBias } from './assignToBlocksForGLB.js';
+import { setPackedVoxelTextures } from './packed-voxel-renderer.js';
+import { renderPixelRatio } from './mobile-ui.js';
 
 const LEGACY_SRGB_ENCODING = 3001;
 
 export class SingleSceneViewer {
 	constructor() {
+		this.exportSession = new VoxelExportSession();
+		this.destroyed = false;
 		const scene = new THREE.Scene();
 		const camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.01, 100);
 		camera.position.z = -0.25; 
@@ -45,7 +51,8 @@ export class SingleSceneViewer {
 		try { directionalLight.layers.enable(1); } catch(e) {}
 		try { light.layers.enable(1); } catch(e) {}
 
-		window.addEventListener('resize', this.resizeCanvas.bind(this));
+		this._resize = this.resizeCanvas.bind(this);
+		window.addEventListener('resize', this._resize);
 		this.scene = scene;
 		this.camera = camera;
 		this.renderer = renderer;
@@ -75,9 +82,10 @@ export class SingleSceneViewer {
 	}
 
 	render() {
+		if (this.destroyed) return;
 		const { renderer, camera, scene } = this;
-	  	requestAnimationFrame(this.render.bind(this));
-	  	renderer.render(scene, camera);
+		this._animationFrame = requestAnimationFrame(() => this.render());
+		if (!document.hidden) renderer.render(scene, camera);
 	}
 
 	resizeCanvas() {
@@ -85,28 +93,42 @@ export class SingleSceneViewer {
 		camera.aspect = window.innerWidth / window.innerHeight;
 		camera.updateProjectionMatrix();
 		renderer.setSize(window.innerWidth, window.innerHeight);
+		renderer.setPixelRatio(renderPixelRatio());
 	}
 
 	async loadGLTFTiles(urlArray, logFn) {
+		const version = this._loadVersion = (this._loadVersion ?? 0) + 1;
+		this._voxelController?.terminate();
+		this.exportSession.dispose();
 		// Resizing/recentering code inspired by by gltf-viewer
 		// https://github.com/donmccurdy/three-gltf-viewer/blob/de78a07180e4141b0b87a0ff4572bc4f7aafec56/src/viewer.js#L246
 		const { scene, controls, camera } = this;
 		// Remove any previous 3D Tiles we were rendering
 		if (this.tilesContainer) {
-			scene.remove(this.tilesContainer);
+			this.clearContent();
 			this.tilesContainer = null;
 		}
 		const tilesContainer = new THREE.Object3D();
 		// Fetch individual glTFs with bounded parallelism instead of serial network waits
 		const { gltfs: gltfArray, stats } = await loadGltfBatch({
 			urls: urlArray,
-			concurrency: 8,
+			concurrency: matchMedia('(pointer: coarse)').matches ? 3 : 8,
 			loadOne: (url) => new Promise((res, rej) => this.gltfLoader.load(url, res, undefined, rej)),
 			onProgress: ({ index, total, loaded, ok, error }) => {
 				if (ok) logFn?.(`Fetched glTF ${loaded}/${total} (parallel x${Math.min(8, total)})`);
 				else logFn?.(`Skipped glTF ${index + 1}/${total} (${error?.message ?? 'load error'})`);
 			},
 		});
+		if (this.destroyed || this._loadVersion !== version) {
+			for (const gltf of gltfArray) gltf.scene.traverse(node => {
+				node.geometry?.dispose();
+				for (const material of [node.material].flat()) if (material) {
+					for (const value of Object.values(material)) if (value?.isTexture) value.dispose();
+					material.dispose();
+				}
+			});
+			return;
+		}
 		for (const gltf of gltfArray) {
 			tilesContainer.add(gltf.scene);
 		}
@@ -179,49 +201,66 @@ export class SingleSceneViewer {
 		controls.update();
 	}
 
-	async generateCombineGltf({ preferMinecraft = true } = {}) {
-		const exporterOpts = { binary: true, maxTextureSize: 4096, onlyVisible: true };
-		const mcApplied = !!(this.voxelMeshes && this.voxelMeshes.some(m => m?.userData?.__mcApplied));
-		const useMinecraft = preferMinecraft && mcApplied;
-		if (useMinecraft && this.voxelizer) {
-			const grid = this.voxelizer._voxelGridRebased || this.voxelizer._voxelGrid;
-			if (grid) {
-				try {
-					const { buildExportGroupFromVoxelGrid } = await import('./assignToBlocksForGLB.js');
-					const exportGroup = await buildExportGroupFromVoxelGrid(grid);
-					if (exportGroup) {
-						exportGLTF(exportGroup, exporterOpts);
-						return;
-					}
-				} catch (err) {
-					console.warn('Falling back to scene export after Minecraft bake error.', err);
-				}
+	async generateCombineGltf() {
+		const bytes = await this.exportGlb();
+		downloadExport(bytes, 'combined_3d_tiles.glb');
+	}
+
+	async exportGlb() {
+		const mesh = this.voxelMeshes?.[0];
+		let input = this.tilesContainer, temporary;
+		try {
+			if (mesh?.visible && this.voxelizer?._voxelGrid) {
+				const surface = await this.exportSession.run(this.voxelizer._voxelGrid,
+					mesh.userData.__mcApplied ? 'surface-blocks' : 'surface-color');
+				temporary = await makeExportGroup(surface);
+				mesh.updateWorldMatrix(true, false);
+				temporary.applyMatrix4(mesh.matrixWorld);
+				input = temporary;
 			}
+			if (!input) throw new Error('No scene to export');
+			return await new GLTFExporter().parseAsync(input, { binary: true, onlyVisible: true, maxTextureSize: 4096 });
+		} finally { temporary?.userData.disposeExport?.(); }
+	}
+
+	async setMinecraftEnabled(enabled) {
+		const bias = getMinecraftBrightnessBias();
+		this._mcEnabled = enabled;
+		if (enabled && this._blockResources?.bias !== bias) {
+			const request = this._blockRequest = {};
+			const resources = await getPackedBlockResources(bias);
+			if (this.destroyed || this._blockRequest !== request) { resources.lookup.dispose(); return; }
+			const previous = this._blockResources;
+			this._blockResources = resources;
+			for (const mesh of this.voxelMeshes) setPackedVoxelTextures(mesh, resources, this._mcEnabled);
+			previous?.lookup.dispose();
 		}
-		exportGLTF(this.scene, exporterOpts);
+		for (const mesh of this.voxelMeshes) setPackedVoxelTextures(mesh, this._blockResources, this._mcEnabled);
+	}
+
+	clearContent() {
+		const materials = new Set(), textures = new Set();
+		this.tilesContainer?.traverse(node => {
+			node.geometry?.dispose();
+			for (const material of [node.material].flat()) if (material) materials.add(material);
+		});
+		for (const material of materials) {
+			for (const value of Object.values(material)) if (value?.isTexture) textures.add(value);
+			material.dispose();
+		}
+		for (const texture of textures) texture.dispose();
+		this.tilesContainer?.removeFromParent(); this.tilesContainer = null;
+		this.voxelMeshes = []; this.voxelizer = null; this.gltfArray = [];
 	}
 
 	destroy() {
-		// Clean up voxel meshes
-		if (this.voxelMeshes) {
-			this.voxelMeshes.forEach(mesh => {
-				this.scene.remove(mesh);
-				if (mesh.geometry) mesh.geometry.dispose();
-				if (mesh.material) {
-					if (Array.isArray(mesh.material)) {
-						mesh.material.forEach(mat => mat.dispose());
-					} else {
-						mesh.material.dispose();
-					}
-				}
-			});
-			this.voxelMeshes = [];
-		}
-		
-		// Clean up resources
-		if (this.tilesContainer) {
-			this.scene.remove(this.tilesContainer);
-		}
+		this.destroyed = true;
+		cancelAnimationFrame(this._animationFrame);
+		window.removeEventListener('resize', this._resize);
+		this.controls.dispose(); this._voxelController?.terminate();
+		this.exportSession.dispose(); this._clearDebugHelpers();
+		this.clearContent(); this._blockResources?.lookup.dispose();
+		this.gltfLoader.dracoLoader?.dispose(); this.gltfLoader.ktx2Loader?.dispose();
 		if (this.renderer.domElement.parentNode) {
 			this.renderer.domElement.parentNode.removeChild(this.renderer.domElement);
 		}
@@ -258,64 +297,4 @@ export class SingleSceneViewer {
 		}
 		this._debugHelpers.length = 0;
 	}
-}
-
-const THREE_PATH = `https://unpkg.com/three@0.160`;
-const DRACO_LOADER = new DRACOLoader().setDecoderPath(`${THREE_PATH}/examples/jsm/libs/draco/gltf/`);
-const gltfLoader = new GLTFLoader();
-gltfLoader.setDRACOLoader(DRACO_LOADER);
-
-function fetchGltf(url) {
-	return new Promise((resolve, reject) => {
-		gltfLoader.load(url, 
-			(gltf) => {
-				resolve(gltf);
-			}, () => {},
-			(error) => {
-				reject(error);
-			});
-	});
-}
-
-function exportGLTF(input, params) {
-	const gltfExporter = new GLTFExporter();
-	const options = {
-		trs: params.trs,
-		onlyVisible: params.onlyVisible,
-		binary: params.binary,
-		maxTextureSize: params.maxTextureSize
-	};
-	gltfExporter.parse(
-		input,
-		function (result) {
-			if (result instanceof ArrayBuffer) {
-				saveArrayBuffer(result, 'combined_3d_tiles.glb');
-			} else {
-				const output = JSON.stringify(result, null, 2);
-				saveString(output, 'combined_3d_tiles.gltf');
-			}
-		},
-		function (error) {
-			console.log('An error happened during parsing', error);
-		},
-		options
-	);
-}
-
-const link = document.createElement('a');
-link.style.display = 'none';
-document.body.appendChild(link);
-
-function save(blob, filename) {
-	link.href = URL.createObjectURL(blob);
-	link.download = filename;
-	link.click();
-}
-
-function saveString(text, filename) {
-	save(new Blob([text], { type: 'text/plain' }), filename);
-}
-
-function saveArrayBuffer(buffer, filename) {
-	save(new Blob([buffer], { type: 'application/octet-stream' }), filename);
 }

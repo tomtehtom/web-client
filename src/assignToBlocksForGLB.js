@@ -4,7 +4,7 @@
 import * as THREE from 'three';
 // Browser-safe NBT shim (pure JS). Provides write()/writeUncompressed().
 import * as _nbt from './nbt.js';
-const NBT = (_nbt?.write || _nbt?.writeUncompressed) ? _nbt : (_nbt?.default || _nbt);
+const NBT = _nbt;
 // Removed: minecraft-data and prismarine-schematic (now writing .schem via direct NBT)
 
 /*
@@ -121,6 +121,7 @@ function toUnit(cAvg) { return cAvg > 1.0001 ? (cAvg / 255) : cAvg; }
 async function getSharedAtlasTexture() {
   if (textureCache.__sharedAtlas) return textureCache.__sharedAtlas;
   const tex = await loader.loadAsync(`/vanilla.png`);
+  tex.colorSpace = THREE.SRGBColorSpace;
   // Pixel-art settings
   tex.magFilter = THREE.NearestFilter;
   tex.minFilter = THREE.NearestFilter;
@@ -354,7 +355,7 @@ function buildBlockKDTree() {
   kdTree = buildKDTree(idx, 0);
 }
 
-function iterateVoxelSamples(voxelGrid, fn) {
+export function iterateVoxelSamples(voxelGrid, fn) {
   if (!voxelGrid || !voxelGrid.gridSize || typeof fn !== 'function') return;
   const NX = voxelGrid.gridSize.x | 0;
   const NY = voxelGrid.gridSize.y | 0;
@@ -366,6 +367,16 @@ function iterateVoxelSamples(voxelGrid, fn) {
   const toMatcherSpace = voxelColorSpace === 'linear'
     ? (c) => Math.min(1, Math.max(0, linearToSrgb(c)))
     : (c) => c;
+  if (voxelGrid.sparse) {
+    const { indices, colors } = voxelGrid.sparse;
+    for (let at = 0; at < indices.length; at++) {
+      const i = indices[at], color = colors[at];
+      fn({ x: i % NX, y: Math.floor(i / NX) % NY, z: Math.floor(i / (NX * NY)), linearIndex: i, count: 1,
+        r: toMatcherSpace((color & 255) / 255), g: toMatcherSpace(((color >>> 8) & 255) / 255),
+        b: toMatcherSpace(((color >>> 16) & 255) / 255), alpha: (color >>> 24) / 255 });
+    }
+    return;
+  }
   if (counts && colors) {
     const len = Math.min(counts.length, total);
     for (let i = 0; i < len; i++) {
@@ -660,6 +671,48 @@ export async function initBlockData() {
   await getSharedAtlasTexture();
 }
 
+// Shared preview lookup: the same 5-6-5 color bins used by block assignment,
+// sampled at deterministic bin centers. Export retains its full grid path.
+export async function getPackedBlockResources(bias = MC_BRIGHTNESS_BIAS) {
+  await initBlockData();
+  if (!BLOCKS.length || !kdTree) throw new Error('Minecraft block palette is unavailable');
+  const blocks = BLOCKS, tree = kdTree;
+  const entry = { blocks, bias, promise: null };
+  entry.promise = (async () => {
+    const data = new Float32Array(256 * 256 * 4);
+    let deadline = performance.now() + 4;
+    // Snapshot matching data so a palette change cannot corrupt an in-flight LUT.
+    const nearest = (node, q, best) => {
+      if (!node) return;
+      const p = blocks[node.blockIndex].oklab;
+      const dl = p.L - q.L, da = p.a - q.a, db = p.b - q.b;
+      const distance = dl * dl + da * da + db * db;
+      if (distance < best.distance) { best.distance = distance; best.index = node.blockIndex; }
+      const key = axisKey(node.axis), delta = q[key] - p[key];
+      nearest(delta < 0 ? node.left : node.right, q, best);
+      if (delta * delta < best.distance) nearest(delta < 0 ? node.right : node.left, q, best);
+    };
+    const best = { distance: Infinity, index: 0 };
+    for (let key = 0; key < 65536; key++) {
+      const q = rgbToOKLab(((key & 31) + 0.5) / 32, (((key >> 5) & 63) + 0.5) / 64, ((key >> 11) + 0.5) / 32);
+      q.L = Math.min(1, Math.max(0, q.L + bias));
+      best.distance = Infinity; nearest(tree, q, best);
+      const uv = blocks[best.index].uv;
+      data.set([uv.offsetX, uv.offsetY, uv.repeatX, uv.repeatY], key * 4);
+      if ((key & 255) === 255 && performance.now() >= deadline) {
+        await new Promise(resolve => setTimeout(resolve, 0)); deadline = performance.now() + 4;
+      }
+    }
+    const lookup = new THREE.DataTexture(data, 256, 256, THREE.RGBAFormat, THREE.FloatType);
+    lookup.minFilter = lookup.magFilter = THREE.NearestFilter;
+    lookup.generateMipmaps = false; lookup.needsUpdate = true;
+    lookup.userData.sharedVoxelResource = true;
+    return { lookup, atlas: await getSharedAtlasTexture(), bias };
+  })();
+  // The preview owner retains/disposes the lookup; the image atlas is borrowed.
+  return entry.promise;
+}
+
 /**
  * assignVoxelsToBlocks(glbDisplay)
  * Build one mesh per block (grouped faces), but all materials point
@@ -843,6 +896,14 @@ export async function buildExportGroupFromVoxelGrid(voxelGrid) {
 }
 
 export { BLOCKS };
+export { getSharedAtlasTexture };
+
+// Worker-only palette snapshot; avoids image decoding and DOM APIs in exporters.
+export function setExportBlockPalette(blocks, bias = 0) {
+  BLOCKS = blocks;
+  MC_BRIGHTNESS_BIAS = bias;
+  buildBlockKDTree();
+}
 
 /* ------------------------------------------------------------------ */
 /* In-place atlas application (UV baking, no shader patch)             */
@@ -1192,24 +1253,39 @@ export function restoreVoxelOriginalMaterial(voxelMesh) {
 // ── EXPORT HELPERS ─────────────────────────────────────────────
 // Build a compact block grid (palette + indexed 3D array) from a voxelGrid.
 // Uses the same KD mapping as MC material assignment to ensure WYSIWYG.
-export function buildBlockGrid(voxelGrid) {
+export function buildBlockGrid(voxelGrid, { maxCells = 50_000_000 } = {}) {
   if (!voxelGrid) throw new Error('buildBlockGrid: voxelGrid required');
-  const idxGrid = computeBlockIndexGrid(voxelGrid);
-  const bounds = idxGrid.getBounds();
-  const hasData = !!bounds;
-  const min = hasData ? bounds.min : { x: 0, y: 0, z: 0 };
-  const size = hasData ? bounds.size : { x: 1, y: 1, z: 1 };
+  // Two sparse passes avoid retaining both an intermediate block-index volume
+  // and a second cropped dense volume at the same time.
+  const min = { x: Infinity, y: Infinity, z: Infinity }, max = { x: -1, y: -1, z: -1 };
+  iterateVoxelSamples(voxelGrid, ({ x, y, z }) => {
+    min.x = Math.min(min.x, x); min.y = Math.min(min.y, y); min.z = Math.min(min.z, z);
+    max.x = Math.max(max.x, x); max.y = Math.max(max.y, y); max.z = Math.max(max.z, z);
+  });
+  const hasData = max.x >= 0;
+  if (!hasData) min.x = min.y = min.z = 0;
+  const size = hasData ? { x: max.x - min.x + 1, y: max.y - min.y + 1, z: max.z - min.z + 1 } : { x: 1, y: 1, z: 1 };
   const SX = size.x | 0;
   const SY = size.y | 0;
   const SZ = size.z | 0;
   const total = Math.max(1, SX * SY * SZ);
+  if (!Number.isSafeInteger(total) || total > maxCells) throw new Error('Export volume is too large for this device. Reduce capture radius or voxel density.');
   const palette = [];
   const remap   = new Map(); // BLOCK index -> palette idx
   const data    = new Int32Array(total);
   data.fill(-1);
+  const cache = new Int32Array(65536); cache.fill(-1);
 
   if (hasData) {
-    idxGrid.forEachFilled((x, y, z, bIdx) => {
+    iterateVoxelSamples(voxelGrid, ({ x, y, z, r, g, b }) => {
+      const key = Math.min(31, Math.max(0, (r * 32) | 0)) + 32 * (Math.min(63, Math.max(0, (g * 64) | 0)) + 64 * Math.min(31, Math.max(0, (b * 32) | 0)));
+      let bIdx = cache[key];
+      if (bIdx < 0) {
+        const q = applyBrightnessBias(voxelGrid.blockMatching === 'packed'
+          ? rgbToOKLab(((key & 31) + .5) / 32, (((key >> 5) & 63) + .5) / 64, ((key >> 11) + .5) / 32)
+          : rgbToOKLab(r, g, b));
+        bIdx = cache[key] = nearestNeighbor(kdTree, q.L, q.a, q.b, { d2: Infinity, idx: -1 }).idx;
+      }
       if (bIdx < 0 || !BLOCKS[bIdx]) return;
       const lx = x - min.x;
       const ly = y - min.y;
