@@ -133,10 +133,9 @@ export class SingleSceneViewer {
 			tilesContainer.add(gltf.scene);
 		}
 		if (!gltfArray.length) {
-			logFn?.('No glTF tiles loaded successfully.');
 			this.tilesContainer = null;
 			this.gltfArray = [];
-			return;
+			throw new Error(`No tiles could be loaded (${stats.failed} failed). Please try again.`);
 		}
 
 		if (logFn) {

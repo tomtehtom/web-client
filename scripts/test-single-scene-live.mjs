@@ -1,21 +1,24 @@
 import assert from 'node:assert/strict';
 import { createServer } from 'vite';
-import { chromium } from 'playwright';
+import { chromium, webkit } from 'playwright';
 import { mkdir, writeFile } from 'node:fs/promises';
 
 // Real mobile-sized Single Scene capture/preview. Export checks use the separate
 // procedural-asset test; this test never exports Earth data or checks confirmations.
 let server, browser;
 const targetUrl = process.env.VOXEL_BASE_URL;
-const report = { target: targetUrl || 'local', errors: [], glbs: 0, json: 0 };
+const name = process.env.VOXEL_BROWSER || 'chrome';
+const report = { target: targetUrl || 'local', browser: name, errors: [], httpErrors: [], glbs: 0, json: 0 };
 try {
   if (!targetUrl) {
     server = await createServer({ server: { host: '127.0.0.1', port: 0, open: false } }); await server.listen();
   }
-  browser = await chromium.launch({ channel: 'chrome', headless: false });
+  browser = await (name === 'webkit' ? webkit : chromium).launch({ headless: false, ...(name === 'webkit' ? {} : { channel: name }) });
   const page = await browser.newPage({ viewport: { width: 390, height: 844 }, deviceScaleFactor: 3, isMobile: true, hasTouch: true, serviceWorkers: 'block' });
   page.on('pageerror', e => report.errors.push(e.message.replace(/\?[^\s]+/g, '?[redacted]')));
-  page.on('response', r => { const path = new URL(r.url()).pathname; if (r.ok() && path.includes('/3dtiles/')) {
+  page.on('response', r => { const path = new URL(r.url()).pathname;
+    if (path.includes('/3dtiles/') && r.status() >= 400) report.httpErrors.push({ status: r.status(), path });
+    if (r.ok() && path.includes('/3dtiles/')) {
     if (path.endsWith('.glb')) report.glbs++; if (path.endsWith('.json')) report.json++;
   } });
   await page.addInitScript(() => localStorage.setItem('coords', '48.85837,2.29448'));
@@ -24,11 +27,12 @@ try {
   await page.waitForFunction(() => window.tiles && window.getVoxelLodStats);
   await page.locator('#model-picker-btn').tap(); await page.locator('[data-model="single-scene"]').tap();
   await page.evaluate(() => {
-    for (const [id, value] of [['single-scene-radius', '50'], ['single-scene-sse', '64'], ['single-scene-res-fine', '16']]) {
+    for (const [id, value] of [['single-scene-radius', '500'], ['single-scene-sse', '20'], ['single-scene-res-fine', '64']]) {
       const input = document.getElementById(id); input.value = value; input.dispatchEvent(new Event('input'));
     }
   });
   const start = Date.now();
+  for (let capture = 0; capture < 2; capture++) {
   await page.locator('#single-scene-fetch').tap();
   for (let i = 0; i < 24; i++) {
     await page.waitForTimeout(5000);
@@ -36,6 +40,7 @@ try {
       voxels: window.singleSceneViewer?.voxelizer?.voxelCount ?? 0, busy: document.querySelector('#single-scene-fetch').disabled }));
     console.log(JSON.stringify({ elapsedMs: Date.now() - start, ...status }));
     if (status.voxels && !status.busy) break;
+  }
   }
   report.previewMs = Date.now() - start;
   report.preview = await page.evaluate(async () => {
@@ -48,6 +53,7 @@ try {
   });
   assert.ok(report.preview.loaded > 0 && report.preview.voxels > 0 && report.preview.packed && report.preview.gridSparse);
   assert.deepEqual(report.errors, []);
+  assert.deepEqual(report.httpErrors, [], 'Default and repeat captures must not issue rejected tile requests');
   await page.locator('#single-scene-panel-toggle').tap();
   await mkdir('output/playwright', { recursive: true });
   await page.screenshot({ path: 'output/playwright/single-scene-live-mobile.png' });

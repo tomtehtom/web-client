@@ -84,6 +84,23 @@ Set `VOXEL_BASE_URL=https://beta.voxelearth.org` when running
 `test-single-scene-live.mjs` or `test-earth-coverage-browser.mjs` to test the
 deployed production client instead of starting a local development server.
 
+## Session and mobile regression fixes
+
+The default 500 m capture reproduced HTTP 400 when Single Scene appended the
+map's loading session to its root request. Captures now refresh the root without
+that identifier, retain sessions from each child URL, and restart discovery once
+if a tileset returns HTTP 400. Failed requests are reported as errors instead of
+an empty location. This follows the root/child URL distinction in
+[Google's renderer documentation](https://developers.google.com/maps/documentation/tile/create-renderer).
+
+Single Scene has its own Options button because the mobile footer is hidden.
+Zoom, tilt and compass controls now act on the visible viewer. Browser regression
+tests tap the Options and texture controls and verify actual camera movement.
+The live capture test now uses the default 500 m radius, SSE 20 and density 64,
+captures twice, and rejects HTTP failures even if an automatic retry succeeds.
+Run `node scripts/test-single-scene-session.mjs` for isolated session regression
+checks, and set `VOXEL_BROWSER=webkit` for the WebKit live capture profile.
+
 ## Remaining limits
 
 The export worker receives one copy of the retained sparse grid. Minecraft

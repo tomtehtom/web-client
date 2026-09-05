@@ -46,6 +46,22 @@ try {
   });
   assert.ok(report.preview.packed && report.preview.sparseGrid && !report.preview.gridDense);
   assert.equal(report.preview.pixelRatio, 1);
+  // Mobile users must reach rendering options without the hidden footer.
+  await page.locator('#single-scene-options').tap();
+  await page.locator('label').filter({ has: page.locator('#toggle-mc') }).tap();
+  await page.waitForFunction(() => window.singleSceneViewer.voxelMeshes[0].userData.__mcApplied);
+  await page.locator('label').filter({ has: page.locator('#toggle-mc') }).tap();
+  await page.locator('#menu-close').tap();
+  const distance = () => page.evaluate(() => {
+    const v = window.singleSceneViewer; return v.camera.position.distanceTo(v.controls.target);
+  });
+  const beforeZoom = await distance();
+  await page.locator('#zoom-in-btn').tap();
+  assert.ok(await distance() < beforeZoom, 'Zoom buttons must move the visible Single Scene camera');
+  await page.locator('#zoom-out-btn').tap();
+  const beforeTilt = await page.evaluate(() => window.singleSceneViewer.camera.position.toArray());
+  await page.locator('#tilt-up-btn').tap();
+  assert.notDeepEqual(await page.evaluate(() => window.singleSceneViewer.camera.position.toArray()), beforeTilt);
   // Rapid sampling-rotation changes cancel obsolete work and keep the old mesh
   // attached until the latest replacement is ready.
   await page.evaluate(() => {

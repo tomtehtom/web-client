@@ -183,6 +183,11 @@ class HUD {
       }
     });
 
+    document.querySelector('#single-scene-options')?.addEventListener('click', (e) => {
+      e.stopPropagation();
+      openMenu();
+    });
+
     closeMenu.addEventListener('click', (e) => {
       e.preventDefault();
       e.stopPropagation();
@@ -621,7 +626,7 @@ class HUD {
             window.singleSceneViewer.setDebugTiles(!!debugTilesToggle.checked);
           }
 
-          this._logSingleScene(`Successfully loaded ${urls.length} tiles`);
+          this._logSingleScene(`Loaded ${window.singleSceneViewer?.gltfArray.length ?? 0} of ${urls.length} tiles`);
 
         } catch (error) {
           this._logSingleScene(`Error: ${error.message}`);
@@ -1506,7 +1511,9 @@ class HUD {
     };
 
     // Update compass needle rotation based on camera
+    const activeOrbit = () => window.singleSceneViewer ?? { camera, controls };
     const updateCompass = () => {
+      const { camera } = activeOrbit();
       if (compassNeedle && camera) {
         const forward = new THREE.Vector3(0, 0, -1);
         forward.applyQuaternion(camera.quaternion);
@@ -1568,9 +1575,10 @@ class HUD {
     // Compass Reset
     if (compassBtn) {
       compassBtn.addEventListener('click', () => {
+        const { camera, controls } = activeOrbit();
         if (!camera) return;
 
-        if (cameraMode === 'freecam') {
+        if (cameraMode === 'freecam' && !window.singleSceneViewer) {
           // In freecam, just reset camera rotation to face north
           const currentPos = camera.position.clone();
           camera.position.copy(currentPos);
@@ -1611,7 +1619,8 @@ class HUD {
     // Zoom Controls
     if (zoomInBtn) {
       zoomInBtn.addEventListener('click', () => {
-        if (cameraMode === 'freecam') {
+        const { camera, controls } = activeOrbit();
+        if (cameraMode === 'freecam' && !window.singleSceneViewer) {
           freecamSpeed = Math.min(freecamSpeed * 1.25, 1000);
         } else if (controls) {
           const factor = 0.8;
@@ -1627,7 +1636,8 @@ class HUD {
 
     if (zoomOutBtn) {
       zoomOutBtn.addEventListener('click', () => {
-        if (cameraMode === 'freecam') {
+        const { camera, controls } = activeOrbit();
+        if (cameraMode === 'freecam' && !window.singleSceneViewer) {
           freecamSpeed = Math.max(freecamSpeed * 0.8, 10);
         } else if (controls) {
           const factor = 1.25;
@@ -1644,7 +1654,8 @@ class HUD {
     // Tilt Controls
     if (tiltUpBtn) {
       tiltUpBtn.addEventListener('click', () => {
-        if (cameraMode === 'freecam') {
+        const { camera, controls } = activeOrbit();
+        if (cameraMode === 'freecam' && !window.singleSceneViewer) {
           camera.rotateX(-0.1);
         } else if (controls && camera) {
           const target = controls.target;
@@ -1664,7 +1675,8 @@ class HUD {
 
     if (tiltDownBtn) {
       tiltDownBtn.addEventListener('click', () => {
-        if (cameraMode === 'freecam') {
+        const { camera, controls } = activeOrbit();
+        if (cameraMode === 'freecam' && !window.singleSceneViewer) {
           camera.rotateX(0.1);
         } else if (controls && camera) {
           const target = controls.target;
@@ -1873,6 +1885,11 @@ function ensureTiles(root, key) {
 
     // Use the tileset's root URL as the base for relative URLs (important for local/custom servers)
     const url = resolveEarthTileUrl(u, root);
+    if (url.pathname.endsWith('/root.json')) {
+      url.searchParams.delete('session');
+      if (url.hostname === 'tile.googleapis.com' && key) url.searchParams.set('key', key);
+      return url.toString();
+    }
 
     if (typeof window !== 'undefined' && window.__photorealSession?.id) {
       const shared = window.__photorealSession;

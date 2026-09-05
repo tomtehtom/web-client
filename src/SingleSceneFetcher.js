@@ -5,7 +5,6 @@ const EARTH_F = 1 / 298.257223563;
 const EARTH_E2 = EARTH_F * (2 - EARTH_F);
 const RAD2DEG = 180 / Math.PI;
 const MAX_TILE_RESULTS = Number.POSITIVE_INFINITY;
-const SESSION_MAX_AGE_MS = 2.5 * 60 * 60 * 1000;
 
 function cartesianFromDegrees(lonDeg, latDeg, height = 0) {
   const lat = (latDeg * Math.PI) / 180;
@@ -111,116 +110,80 @@ function boundingVolumeToSphere(volume) {
   return null;
 }
 
-function getSharedSession() {
-  const state = globalThis.__photorealSession;
-  if (!state || !state.id) return null;
-  if (Date.now() - (state.ts || 0) > SESSION_MAX_AGE_MS) return null;
-  return state.id;
-}
-
-function setSharedSession(id) {
-  if (!id) {
-    globalThis.__photorealSession = null;
-    return;
-  }
-  globalThis.__photorealSession = { id, ts: Date.now() };
-}
-
 export class SingleSceneFetcher {
   constructor({ concurrency = typeof matchMedia !== 'undefined' && matchMedia('(pointer: coarse)').matches ? 3 : 6 } = {}) {
     this.concurrency = Math.max(1, concurrency);
-    this._sessionKey = null;
-    this._sessionTs = 0;
   }
 
   async fetch3DTiles(lat, lng, zoom, targetScreenSpaceError, apiKey, logFn, radiusMeters, rootUrlString) {
     const radius = Math.max(50, Number.isFinite(radiusMeters) ? radiusMeters : 500);
     const centerECEF = cartesianFromDegrees(lng, lat, 0);
     const regionSphere = new Sphere(centerECEF, radius);
-    const startingSession = this._isSessionFresh() ? this._sessionKey : (getSharedSession() || null);
-    let active = 0;
-    const waiters = [];
-    const sessionRef = { value: startingSession, visited: new Set(), limit: async fn => {
-      if (active >= this.concurrency) await new Promise(resolve => waiters.push(resolve));
-      else active++;
-      try { return await fn(); }
-      finally { if (waiters.length) waiters.shift()(); else active--; }
-    } };
-    if (startingSession) {
-      this._sessionKey = startingSession;
-      this._sessionTs = Date.now();
+    // A root request starts a loading session. Child URLs carry its identifier;
+    // borrowing the map's session here makes the root endpoint return HTTP 400.
+    for (let attempt = 0; attempt < 2; attempt++) {
+      let active = 0;
+      const waiters = [];
+      const controller = new AbortController();
+      const sessionRef = { signal: controller.signal, visited: new Set(), limit: async fn => {
+        if (active >= this.concurrency) await new Promise(resolve => waiters.push(resolve));
+        else active++;
+        try { controller.signal.throwIfAborted(); return await fn(); }
+        finally { if (waiters.length) waiters.shift()(); else active--; }
+      } };
+      const urls = [];
+      const rootUrl = rootUrlString ? new URL(rootUrlString) : new URL('https://tile.googleapis.com/v1/3dtiles/root.json');
+
+      // Only append key for Google host
+      if (rootUrl.hostname === 'tile.googleapis.com' && apiKey && !rootUrl.searchParams.has('key')) {
+        rootUrl.searchParams.set('key', apiKey);
+      }
+
+      rootUrl.searchParams.delete('session');
+
+      logFn?.(`Fetching tiles within ${radius.toFixed(0)} m, SSE ${targetScreenSpaceError}`);
+
+      try {
+        await this._walkTileset(rootUrl, regionSphere, apiKey, sessionRef, targetScreenSpaceError, urls, logFn, 0);
+      } catch (error) {
+        controller.abort();
+        if (error.status === 400 && attempt === 0) {
+          logFn?.('Refreshing the tile session…');
+          continue;
+        }
+        throw error;
+      }
+      logFn?.(`Found ${urls.length} tile(s).`);
+      return [...new Set(urls)];
     }
-    const urls = [];
-    const rootUrl = rootUrlString ? new URL(rootUrlString) : new URL('https://tile.googleapis.com/v1/3dtiles/root.json');
-
-    // Only append key for Google host
-    if (rootUrl.hostname === 'tile.googleapis.com' && apiKey && !rootUrl.searchParams.has('key')) {
-      rootUrl.searchParams.set('key', apiKey);
-    }
-
-    if (sessionRef.value && !rootUrl.searchParams.has('session')) {
-      rootUrl.searchParams.set('session', sessionRef.value);
-    }
-
-    logFn?.(`Fetching tiles within ${radius.toFixed(0)} m, SSE ${targetScreenSpaceError}`);
-
-    await this._walkTileset(rootUrl, regionSphere, apiKey, sessionRef, targetScreenSpaceError, urls, logFn, 0);
-
-    if (sessionRef.value) {
-      this._sessionKey = sessionRef.value;
-      this._sessionTs = Date.now();
-      setSharedSession(sessionRef.value);
-    }
-
-    logFn?.(`Found ${urls.length} tile(s).`);
-    return [...new Set(urls)];
   }
 
-  async _walkTileset(url, regionSphere, apiKey, sessionRef, targetSSE, urls, logFn, depth, attempt = 0) {
+  async _walkTileset(url, regionSphere, apiKey, sessionRef, targetSSE, urls, logFn, depth) {
     if (!url || urls.length >= MAX_TILE_RESULTS) return;
     const urlStr = url.toString();
-    if (attempt === 0 && sessionRef.visited.has(urlStr)) return;
+    if (sessionRef.visited.has(urlStr)) return;
     sessionRef.visited.add(urlStr);
 
     const urlObj = url instanceof URL ? new URL(url) : new URL(String(url));
     if (urlObj.hostname === 'tile.googleapis.com' && apiKey && !urlObj.searchParams.has('key')) urlObj.searchParams.set('key', apiKey);
-    if (sessionRef.value && !urlObj.searchParams.has('session')) {
-      urlObj.searchParams.set('session', sessionRef.value);
-    } else if (!sessionRef.value) {
-      const shared = getSharedSession();
-      if (shared) {
-        urlObj.searchParams.set('session', shared);
-        sessionRef.value = shared;
-      }
-    }
 
     let resp, json;
     try {
       const loaded = await sessionRef.limit(async () => {
-        const response = await fetch(urlObj.toString(), { cache: 'force-cache' });
+        const response = await fetch(urlObj.toString(), { cache: depth === 0 ? 'reload' : 'default', signal: sessionRef.signal });
         return { response, json: response.ok ? await response.json() : null };
       });
       resp = loaded.response; json = loaded.json;
     } catch (err) {
-      logFn?.(`Failed to load ${urlObj.pathname}: ${err?.message || err}`);
-      return;
+      if (sessionRef.signal.aborted) throw err;
+      throw new Error(`Could not reach the tile server (${urlObj.pathname}). Please try again.`, { cause: err });
     }
     if (!resp.ok) {
-      if (sessionRef.value && [400, 401, 403].includes(resp.status)) {
-        logFn?.(`Session rejected (HTTP ${resp.status}); retrying without session.`);
-        this._clearSession(sessionRef);
-        if (attempt < 1) {
-          return this._walkTileset(new URL(urlStr), regionSphere, apiKey, sessionRef, targetSSE, urls, logFn, depth, attempt + 1);
-        }
-      }
-      logFn?.(`HTTP ${resp.status} for ${urlObj.pathname}`);
-      return;
+      const error = new Error(`Tile server returned HTTP ${resp.status} for ${urlObj.pathname}. Please try again${[401, 403].includes(resp.status) ? ' or check your API key' : ''}.`);
+      error.status = resp.status;
+      throw error;
     }
-    try {
-      const respSession = new URL(resp.url).searchParams.get('session');
-      if (respSession) this._setSession(sessionRef, respSession);
-    } catch { }
-    if (!json?.root) return;
+    if (!json?.root) throw new Error('The tile server returned an invalid tileset. Please try again.');
     await this._walkNode(json.root, urlObj, regionSphere, apiKey, sessionRef, targetSSE, urls, logFn, depth);
   }
 
@@ -283,11 +246,9 @@ export class SingleSceneFetcher {
       return;
     }
     if (contentURL.hostname === 'tile.googleapis.com' && apiKey && !contentURL.searchParams.has('key')) contentURL.searchParams.set('key', apiKey);
-    if (sessionRef.value && !contentURL.searchParams.has('session')) {
-      contentURL.searchParams.set('session', sessionRef.value);
+    if (contentURL.origin === baseUrl.origin && !contentURL.searchParams.has('session') && baseUrl.searchParams.has('session')) {
+      contentURL.searchParams.set('session', baseUrl.searchParams.get('session'));
     }
-    const sessionParam = contentURL.searchParams.get('session');
-    if (sessionParam) this._setSession(sessionRef, sessionParam);
 
     const href = contentURL.toString();
     const mime = (content.type || content.mimeType || content.contentType || '').toLowerCase();
@@ -310,22 +271,4 @@ export class SingleSceneFetcher {
     logFn?.(`Skipping non-GLB content (${content.type || 'unknown'}): ${href}`);
   }
 
-  _isSessionFresh() {
-    return !!(this._sessionKey && (Date.now() - this._sessionTs < SESSION_MAX_AGE_MS));
-  }
-
-  _setSession(sessionRef, value) {
-    if (!value || sessionRef.value === value) return;
-    sessionRef.value = value;
-    this._sessionKey = value;
-    this._sessionTs = Date.now();
-    setSharedSession(value);
-  }
-
-  _clearSession(sessionRef) {
-    sessionRef.value = null;
-    this._sessionKey = null;
-    this._sessionTs = 0;
-    setSharedSession(null);
-  }
 }
