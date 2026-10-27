@@ -540,6 +540,10 @@ function createSharedWebGpuWorkerSlot(index) {
 function attachSharedWebGpuWorkerHandlers(pool, slot) {
   slot.worker.onmessage = (e) => {
     const job = slot.current;
+    if (e.data.status === 'progress') {
+      if (job && !job.controller.cancelled) job.onProgress?.(e.data.message);
+      return;
+    }
     slot.current = null;
     slot.busy = false;
     if (!job) return;
@@ -558,6 +562,7 @@ function attachSharedWebGpuWorkerHandlers(pool, slot) {
       return;
     }
 
+    job.onProgress?.('Attaching voxel preview to the renderer…');
     rebuildWorkerGeometry(
       result,
       job.serializeStartedAt,
@@ -640,6 +645,7 @@ function pumpSharedWebGpuWorkerQueue() {
         slot.worker = createVoxelWorker();
         attachSharedWebGpuWorkerHandlers(pool, slot);
       }
+      job.onProgress?.('Worker started; preparing geometry…');
       slot.worker.postMessage(job.payload, job.transfers);
     } catch (error) {
       resetSharedWebGpuWorkerSlot(pool, slot);
@@ -648,13 +654,14 @@ function pumpSharedWebGpuWorkerQueue() {
   }
 }
 
-function enqueueSharedWebGpuWorkerJob({ payload, transfers, onStart, serializeStartedAt, mainThreadPolicy }) {
+function enqueueSharedWebGpuWorkerJob({ payload, transfers, onStart, onProgress, serializeStartedAt, mainThreadPolicy }) {
   const pool = getSharedWebGpuWorkerPool();
   return new Promise((resolve, reject) => {
     const job = {
       payload,
       transfers,
       onStart,
+      onProgress,
       serializeStartedAt,
       mainThreadPolicy,
       workerPostedAt: 0,
@@ -687,12 +694,14 @@ function enqueueSharedWebGpuWorkerJob({ payload, transfers, onStart, serializeSt
       try { onStart(job.controller); } catch {}
     }
     if (job.controller.cancelled) return;
+    onProgress?.('Waiting for a voxel worker…');
     pool.queue.push(job);
     pumpSharedWebGpuWorkerQueue();
   });
 }
 
-function voxelizeModelWithWorker({ model, serializedModel = null, resolution = 200, needGrid = false, method = '2.5d-scan', renderMode = 'mesh', onStart, preRotateYDeg = 0, mainThreadPolicy = null }) {
+async function voxelizeModelWithWorker({ model, serializedModel = null, resolution = 200, voxelSize = null, needGrid = false, method = '2.5d-scan', renderMode = 'mesh', onStart, onProgress, preRotateYDeg = 0, mainThreadPolicy = null }) {
+  if (onProgress) { onProgress('Serializing model geometry and textures…'); await nextFrame(); }
   return new Promise((resolve, reject) => {
     const serializeStartedAt = nowMs();
     const payload = serializedModel ?? serializeModel(model, { preRotateYDeg });
@@ -708,29 +717,33 @@ function voxelizeModelWithWorker({ model, serializedModel = null, resolution = 2
     // Reuse workers for JS/WASM as well as WebGPU: repeated LOD builds keep
     // their module/JIT/WASM startup warm and share one cancellable queue.
     enqueueSharedWebGpuWorkerJob({
-        payload: { modelData: payload, resolution, needGrid, method, renderMode },
+        payload: { modelData: payload, resolution, voxelSize, needGrid, method, renderMode, reportProgress: !!onProgress },
         transfers,
         onStart,
+        onProgress,
         serializeStartedAt,
         mainThreadPolicy,
     }).then(resolve, reject);
   });
 }
 
-async function voxelizeModelWithWebGpu({ model, renderer, resolution = 200, needGrid = false, method = 'webgpu', renderMode = 'mesh', onStart, preRotateYDeg = 0, mainThreadPolicy = null }) {
+async function voxelizeModelWithWebGpu({ model, renderer, resolution = 200, voxelSize = null, needGrid = false, method = 'webgpu', renderMode = 'mesh', onStart, onProgress, preRotateYDeg = 0, mainThreadPolicy = null }) {
+  if (onProgress) { onProgress('Serializing model geometry and textures…'); await nextFrame(); }
   const serializedModel = serializeModel(model, { preRotateYDeg });
   const { useWebGpu, analysis } = shouldUseWebGpuForSerializedModel(serializedModel, resolution);
   const dispatchMethod = useWebGpu ? 'webgpu' : '2.5d-scan';
-  const dispatchRenderMode = needGrid ? 'mesh' : renderMode;
+  const dispatchRenderMode = renderMode;
 
   const result = await voxelizeModelWithWorker({
     model,
     serializedModel,
     resolution,
+    voxelSize,
     needGrid,
     method: dispatchMethod,
     renderMode: dispatchRenderMode,
     onStart,
+    onProgress,
     preRotateYDeg,
     mainThreadPolicy,
   });
@@ -756,7 +769,8 @@ async function voxelizeModelWithWebGpu({ model, renderer, resolution = 200, need
   };
 }
 
-export async function voxelizeModel({ model, renderer = null, resolution = 200, needGrid = false, method = '2.5d-scan', renderMode = 'mesh', onStart, preRotateYDeg = 0, mainThreadPolicy = null }) {
+export async function voxelizeModel({ model, renderer = null, resolution = 200, voxelSize = null, needGrid = false, method = '2.5d-scan', renderMode = 'mesh', onStart, onProgress, preRotateYDeg = 0, mainThreadPolicy = null }) {
+  if (voxelSize !== null && (!Number.isFinite(voxelSize) || voxelSize <= 0)) throw new Error('Block size must be a positive finite number');
   // Packed shaders target WebGL2; Three's WebGPU renderer needs conventional
   // geometry. Export grids can accompany either representation.
   if (renderMode === 'packed' && renderer?.isWebGPURenderer) {
@@ -764,7 +778,7 @@ export async function voxelizeModel({ model, renderer = null, resolution = 200, 
   }
   if (method === 'webgpu') {
     try {
-      return await voxelizeModelWithWebGpu({ model, renderer, resolution, needGrid, method, renderMode, onStart, preRotateYDeg, mainThreadPolicy });
+      return await voxelizeModelWithWebGpu({ model, renderer, resolution, voxelSize, needGrid, method, renderMode, onStart, onProgress, preRotateYDeg, mainThreadPolicy });
     } catch (error) {
       if (isVoxelizationCancellationError(error)) {
         throw error;
@@ -772,10 +786,12 @@ export async function voxelizeModel({ model, renderer = null, resolution = 200, 
       const fallback = await voxelizeModelWithWorker({
         model,
         resolution,
+        voxelSize,
         needGrid,
         method: '2.5d-scan',
-        renderMode: needGrid ? 'mesh' : renderMode,
+        renderMode,
         onStart,
+        onProgress,
         preRotateYDeg,
         mainThreadPolicy,
       });
@@ -793,5 +809,5 @@ export async function voxelizeModel({ model, renderer = null, resolution = 200, 
     }
   }
 
-  return voxelizeModelWithWorker({ model, resolution, needGrid, method, renderMode, onStart, preRotateYDeg, mainThreadPolicy });
+  return voxelizeModelWithWorker({ model, resolution, voxelSize, needGrid, method, renderMode, onStart, onProgress, preRotateYDeg, mainThreadPolicy });
 }

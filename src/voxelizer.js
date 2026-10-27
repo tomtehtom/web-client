@@ -1073,25 +1073,25 @@ fn compute(
             const d20 = ep.dot(e0);
             const d21 = ep.dot(e1);
             const denom = d00 * d11 - d01 * d01;
+            const validBarycentric = denom > 16 * Number.EPSILON * d00 * d11;
 
-            let vv = 0;
-            let ww = 0;
-            let uu = 1;
+            let vv = 1 / 3;
+            let ww = 1 / 3;
+            let uu = 1 / 3;
 
-            if (Math.abs(denom) > 1e-12) {
+            if (validBarycentric) {
               const inv = 1 / denom;
               vv = (d11 * d20 - d01 * d21) * inv;
               ww = (d00 * d21 - d01 * d20) * inv;
               uu = 1 - vv - ww;
             }
 
-            if (uu < 0 || vv < 0 || ww < 0) {
+            if (validBarycentric && (uu < 0 || vv < 0 || ww < 0)) {
               triangle.closestPointToPoint(closest.copy(ep).add(v0), closest);
               ep.copy(closest).sub(v0);
               const d20c = ep.dot(e0);
               const d21c = ep.dot(e1);
-              const safeDenom = Math.abs(denom) > 1e-12 ? denom : 1;
-              const inv = 1 / safeDenom;
+              const inv = 1 / denom;
               vv = (d11 * d20c - d01 * d21c) * inv;
               ww = (d00 * d21c - d01 * d20c) * inv;
               uu = 1 - vv - ww;

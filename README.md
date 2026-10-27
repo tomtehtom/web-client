@@ -6,6 +6,10 @@ A lightweight web client that fetches Google Photorealistic **3D Tiles**, normal
 > Based on (and thanks to) **Omar Shehata’s** work in **google-earth-as-gltf**, which demonstrates fetching 3D Tiles and normalizing them into viewable glTF.
 
 ## Run locally
+
+On Windows, double-click `Start-Editor.cmd`. See the
+[local Minecraft editor guide](docs/local-minecraft-editor.md) for life-size
+scale, rotation, large-area tiled exports and Minecraft placement instructions.
 ```bash
 npm install
 npm run dev        # starts the dev server

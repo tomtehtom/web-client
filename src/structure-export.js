@@ -1,8 +1,9 @@
 import { ByteWriter, writeUncompressed } from './nbt.js';
+import { MINECRAFT_DATA_VERSION } from './minecraft-version.js';
 
 // Write each occupied block straight to bytes, avoiding two object graphs with
 // several objects and arrays per voxel before NBT encoding even starts.
-export async function writeStructureGrid({ size, palette, data }, dataVersion = 3955) {
+export async function writeStructureGrid({ size, palette, data }, dataVersion = MINECRAFT_DATA_VERSION) {
   const head = writeUncompressed({ type: 'compound', name: '', value: {
     DataVersion: { type: 'int', value: dataVersion },
     size: { type: 'list', value: { type: 'int', value: [size.x, size.y, size.z] } },

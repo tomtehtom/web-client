@@ -1,5 +1,5 @@
 import { meshVoxelChunks } from './greedy-mesher.js';
-import { iterateVoxelSamples } from './assignToBlocksForGLB.js';
+import { iterateVoxelSamples, BLOCKS } from './assignToBlocksForGLB.js';
 
 // Export ordinary glTF-compatible greedy surfaces, with internal faces removed.
 // Preview stays packed; expanded buffers exist only for the duration of export.
@@ -27,17 +27,30 @@ export function buildVoxelExportSurface(grid, blockGrid = null) {
   }
   const origin = Array.isArray(grid.bbox.min) ? grid.bbox.min : [grid.bbox.min.x, grid.bbox.min.y, grid.bbox.min.z];
   const result = meshVoxelChunks(store, { origin, voxelSize: grid.unit.x });
+  const materialPalette = [], materialFaces = [], materialByKey = new Map();
+  const faceMaterials = blockGrid?.palette.map(name => {
+    const block = BLOCKS.find(block => block.name === name);
+    return Array.from({ length: 6 }, (_, face) => {
+      const rect = block?.faceUvs?.[face] ?? block?.uv;
+      const key = JSON.stringify([name, rect]);
+      if (!materialByKey.has(key)) {
+        materialByKey.set(key, materialPalette.length); materialPalette.push(name); materialFaces.push(face);
+      }
+      return materialByKey.get(key);
+    });
+  });
   if (blockGrid) for (const geometry of result.geometries) {
     const { positions: p, colors8, indices } = geometry;
     const uv = new Float32Array(p.length / 3 * 2), byMaterial = new Map();
     for (let q = 0; q < indices.length / 6; q++) {
       const c = q * 16, base = q * 12;
-      const material = (colors8[c] | (colors8[c + 1] << 8) | (colors8[c + 2] << 16)) - 1;
+      const blockIndex = (colors8[c] | (colors8[c + 1] << 8) | (colors8[c + 2] << 16)) - 1;
+      const axis = [0, 1, 2].find(d => p[base + d] === p[base + 3 + d] && p[base + d] === p[base + 6 + d]);
+      const sign = indices[q * 6 + 1] === q * 4 + 1 ? 1 : -1;
+      const material = faceMaterials[blockIndex][axis * 2 + (sign > 0 ? 1 : 0)];
       let list = byMaterial.get(material);
       if (!list) { list = []; byMaterial.set(material, list); }
       for (let i = q * 6; i < q * 6 + 6; i++) list.push(indices[i]);
-      const axis = [0, 1, 2].find(d => p[base + d] === p[base + 3 + d] && p[base + d] === p[base + 6 + d]);
-      const sign = indices[q * 6 + 1] === q * 4 + 1 ? 1 : -1;
       for (let v = 0; v < 4; v++) {
         const at = base + v * 3, x = Math.round((p[at] - p[base]) / grid.unit.x);
         const y = Math.round((p[at + 1] - p[base + 1]) / grid.unit.x), z = Math.round((p[at + 2] - p[base + 2]) / grid.unit.x);
@@ -52,5 +65,5 @@ export function buildVoxelExportSurface(grid, blockGrid = null) {
     }
     geometry.uv = uv; delete geometry.colors8;
   }
-  return { geometries: result.geometries, stats: result.meshStats, palette: blockGrid?.palette ?? null };
+  return { geometries: result.geometries, stats: result.meshStats, palette: blockGrid ? materialPalette : null, materialFaces };
 }

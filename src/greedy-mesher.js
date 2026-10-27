@@ -2,7 +2,7 @@ import { createPackedChunkWriter } from './packed-voxel-format.js';
 
 // Opaque surface meshing. Chunk interiors own their faces; the one-cell halo
 // supplies neighbor occupancy only, so seams never emit duplicate geometry.
-export function meshVoxelChunks(store, { origin = [0, 0, 0], voxelSize = 1, paletteColors8 = null, packed = false } = {}) {
+export function meshVoxelChunks(store, { origin = [0, 0, 0], voxelSize = 1, paletteColors8 = null, packed = false, onProgress = null } = {}) {
   const { chunkSize: size, nx, ny, nz } = store.indexer;
   if (packed && (size > 32 || size < 1)) throw new RangeError('Packed voxel chunks must have size 1..32');
   const edge = size + 2;
@@ -17,7 +17,9 @@ export function meshVoxelChunks(store, { origin = [0, 0, 0], voxelSize = 1, pale
   let atlasBytes = 0;
   let texturedQuadCount = 0;
 
+  let processed = 0;
   for (const chunk of store.chunks.values()) {
+    if ((processed++ & 31) === 0) onProgress?.(processed - 1, store.chunks.size);
     halo.fill(0);
     const base = [chunk.cx * size, chunk.cy * size, chunk.cz * size];
     const dims = [Math.min(size, nx - base[0]), Math.min(size, ny - base[1]), Math.min(size, nz - base[2])];
@@ -164,5 +166,6 @@ export function meshVoxelChunks(store, { origin = [0, 0, 0], voxelSize = 1, pale
     geometryBytes += positions.byteLength + colors8.byteLength + indices.byteLength;
     geometries.push({ positions, colors8, indices, bounds });
   }
+  onProgress?.(processed, store.chunks.size);
   return { geometries, packedChunks, meshStats: { occupiedChunkCount: store.chunks.size, drawChunkCount: geometries.length + packedChunks.length, visibleFaceCount, quadCount, triangleCount: quadCount * 2, geometryBytes, atlasBytes, renderBytes: geometryBytes + atlasBytes, texturedQuadCount } };
 }

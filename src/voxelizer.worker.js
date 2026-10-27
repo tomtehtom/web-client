@@ -788,6 +788,13 @@ function kMeansPalette(colors, k = 64, iters = 8) {
 
 // --- The Main Voxelizer Class ---
 export class WorkerVoxelizer {
+    #progress(message, completed, total) {
+        if (!this.onProgress) return;
+        const now = nowMs();
+        if (message === this._progressPhase && now - this._progressTime < 1000 && completed !== total) return;
+        this._progressPhase = message; this._progressTime = now;
+        this.onProgress(total == null ? message : `${message}: ${completed.toLocaleString()}/${total.toLocaleString()} (${Math.floor(completed / Math.max(1, total) * 100)}%)`);
+    }
     async init({
         modelData,
         voxelSize,
@@ -796,10 +803,13 @@ export class WorkerVoxelizer {
         needGrid = false,
         method = '2.5d-scan',
         renderMode = 'mesh',
-        hitStoreMode = 'auto'
+        hitStoreMode = 'auto',
+        onProgress = null
     }) {
         const startedAt = nowMs();
         this.voxelSize = voxelSize;
+        this.onProgress = onProgress;
+        this.#progress(`Preparing ${modelData.meshes.length} source meshes`);
         this.paletteSize = paletteSize;
         this.needGrid = needGrid;
         this.method = method;
@@ -1091,9 +1101,12 @@ export class WorkerVoxelizer {
 
     #configureGridFromBox(rawBox, maxGrid, alignToVoxelGrid = false) {
         const rawSize = rawBox.getSize(new THREE.Vector3());
-        let nx = Math.ceil(rawSize.x / this.voxelSize);
-        let ny = Math.ceil(rawSize.y / this.voxelSize);
-        let nz = Math.ceil(rawSize.z / this.voxelSize);
+        // ECEF recentering and normalized scale introduce tiny roundoff at
+        // integer metre boundaries. Do not turn 8.000000000000002 into 9 cells.
+        const cells = extent => Math.ceil(extent / this.voxelSize - 1e-9);
+        let nx = cells(rawSize.x);
+        let ny = cells(rawSize.y);
+        let nz = cells(rawSize.z);
         const m = Math.max(nx, ny, nz);
         const scale = Number.isFinite(maxGrid) && m > maxGrid ? maxGrid / m : 1;
         this.voxelSize /= scale;
@@ -1116,13 +1129,14 @@ export class WorkerVoxelizer {
 
         const finalSize = this.bbox.getSize(new THREE.Vector3());
         this.grid = new THREE.Vector3(
-            Math.max(1, Math.ceil(finalSize.x / this.voxelSize)),
-            Math.max(1, Math.ceil(finalSize.y / this.voxelSize)),
-            Math.max(1, Math.ceil(finalSize.z / this.voxelSize))
+            Math.max(1, cells(finalSize.x)),
+            Math.max(1, cells(finalSize.y)),
+            Math.max(1, cells(finalSize.z))
         );
     }
 
     async #webGpuRasterizeInWorker() {
+        this.#progress('Voxelizing source geometry on WebGPU');
         const webgpu = await ensureWorkerWebGpu();
         if (!webgpu) {
             throw new Error('WebGPU is unavailable in worker context');
@@ -1268,6 +1282,7 @@ export class WorkerVoxelizer {
     }
 
     #rustWasmRasterize2D5() {
+        this.#progress('Voxelizing geometry with Rust/WASM');
         const NX = this.grid.x | 0;
         const NY = this.grid.y | 0;
         const NZ = this.grid.z | 0;
@@ -1487,8 +1502,10 @@ export class WorkerVoxelizer {
         let vertexOffset = 0;
         let indexOffset = 0;
         let triMatOffset = 0;
+        let bakedMeshes = 0;
 
         for (const meshData of modelData.meshes) {
+            this.#progress('Baking source meshes', bakedMeshes++, modelData.meshes.length);
             const positionAttr = meshData.geometry?.attributes?.position;
             if (!positionAttr?.array?.length) continue;
 
@@ -2159,6 +2176,7 @@ export class WorkerVoxelizer {
         // For each triangle
         const triCount = (this.indices.length / 3) | 0;
         for (let t = 0; t < triCount; t++) {
+            if ((t & 1023) === 0) this.#progress('Voxelizing triangles', t, triCount);
             const i0 = this.indices[t*3+0], i1 = this.indices[t*3+1], i2 = this.indices[t*3+2];
 
             // Fetch vertices in voxel space
@@ -2315,6 +2333,7 @@ export class WorkerVoxelizer {
 
         const numTriangles = this.indices.length / 3;
         for (let i = 0; i < numTriangles; i++) {
+            if ((i & 255) === 0) this.#progress('Voxelizing triangles (3D SAT)', i, numTriangles);
             v0.fromArray(this.positions, this.indices[i*3 + 0] * 3);
             v1.fromArray(this.positions, this.indices[i*3 + 1] * 3);
             v2.fromArray(this.positions, this.indices[i*3 + 2] * 3);
@@ -2446,6 +2465,7 @@ export class WorkerVoxelizer {
       }
 
       const processVoxelHit = (lin, triId) => {
+        if ((sampled++ & 16383) === 0) this.#progress('Sampling occupied voxel colours', sampled, voxelHits.size);
         const gx = lin % NX;
         const gy = ((lin / NX) | 0) % NY;
         const gz = (lin / (NX*NY)) | 0;
@@ -2480,8 +2500,13 @@ export class WorkerVoxelizer {
         const d00 = e0.dot(e0), d01 = e0.dot(e1), d11 = e1.dot(e1);
         const d20 = ep.dot(e0), d21 = ep.dot(e1);
         const denom = d00 * d11 - d01 * d01;
-        let u_b = 0.33, v_b = 0.33, w_b = 0.34;
-        if (Math.abs(denom) > 1e-9) {
+        // The viewer normalizes whole captures to roughly one unit. A fixed
+        // determinant threshold mistakes perfectly valid small triangles for
+        // degenerate ones and samples their centroid for every voxel, creating
+        // triangle-shaped colour patches. Compare relative to edge lengths.
+        const validBarycentric = denom > 16 * Number.EPSILON * d00 * d11;
+        let u_b = 1 / 3, v_b = 1 / 3, w_b = 1 / 3;
+        if (validBarycentric) {
           const inv = 1.0 / denom;
           v_b = (d11 * d20 - d01 * d21) * inv;
           w_b = (d00 * d21 - d01 * d20) * inv;
@@ -2556,6 +2581,7 @@ export class WorkerVoxelizer {
         paletteStore.set(gx, gy, gz, best + 1); // store +1 to distinguish 0 = empty
       };
 
+      let sampled = 0;
       if (voxelHits.mode === 'dense') {
         const triangles = voxelHits.triangles;
         for (let lin = 0; lin < triangles.length; lin++) {
@@ -2578,11 +2604,13 @@ export class WorkerVoxelizer {
       }
 
       this._colorStore = colorStore;
+      this.#progress('Building preview mesh', 0, paletteStore.chunks.size);
       return meshVoxelChunks(paletteStore, {
         origin: [this.bbox.min.x, this.bbox.min.y, this.bbox.min.z],
         voxelSize: this.voxelSize,
         paletteColors8: exactColors ? null : paletteColors8,
         packed: this.renderMode === 'packed',
+        onProgress: (completed, total) => this.#progress('Building preview mesh', completed, total),
       });
     }
 
@@ -2788,6 +2816,7 @@ export class WorkerVoxelizer {
     }
     
     #getVoxelGridData() {
+        this.#progress('Preparing sparse export grid');
         const NX = this.grid.x | 0, NY = this.grid.y | 0, NZ = this.grid.z | 0;
         const tot = NX * NY * NZ;
         const base = {
@@ -2880,11 +2909,18 @@ if (typeof self !== 'undefined') {
                 const size = new THREE.Vector3();
                 bbox.getSize(size);
                 const maxDim = Math.max(size.x, size.y, size.z);
-                const voxelSize = maxDim / resolution;
-                result = await voxelizer.init({ modelData, voxelSize, needGrid, method, renderMode, hitStoreMode });
+                const voxelSize = event.data.voxelSize ?? maxDim / resolution;
+                if (!Number.isFinite(voxelSize) || voxelSize <= 0) throw new Error('Invalid voxel size');
+                const dims = size.toArray().map(v => Math.max(1, Math.ceil(v / voxelSize)));
+                if (dims.some(v => v > 0x7fffffff) || !Number.isSafeInteger(dims[0] * dims[1] * dims[2])) {
+                    throw new Error('Capture exceeds the supported coordinate range. Reduce radius or increase metres per block.');
+                }
+                result = await voxelizer.init({ modelData, voxelSize, needGrid, method, renderMode, hitStoreMode,
+                    onProgress: event.data.reportProgress ? message => self.postMessage({ status: 'progress', message }) : null });
             }
 
             if (result.packedChunks?.length && event.data.batchPacked !== false) {
+                if (event.data.reportProgress) self.postMessage({ status: 'progress', message: 'Packing preview batches and preparing transfer…' });
                 const started = nowMs();
                 result.packedChunks = batchPackedVoxelChunks(result.packedChunks);
                 const mesh = result.stats.mesh;

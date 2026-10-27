@@ -28,8 +28,11 @@ import {
   restoreVoxelOriginalMaterial,
   setMinecraftBrightnessBias,
   getMinecraftBrightnessBias,
-  getPackedBlockResources
+  getPackedBlockResources,
+  configureBlockPalette, getBlockPaletteKey, BLOCKS,
+  setBlockMatchingMode, getMinecraftBlockCatalog, setBlockColourProfile
 } from './assignToBlocksForGLB.js';
+import { DEFAULT_BLOCK_PALETTE, normalizeBlockPalette, parseBlockPalette, exportBlockCatalog } from './block-palette.js';
 import { SingleSceneViewer } from './SingleSceneViewer.js';
 import { SingleSceneFetcher } from './SingleSceneFetcher.js';
 import { getActiveServerUrl, isLocalServer, resolveEarthTileUrl } from './config.js';
@@ -265,7 +268,7 @@ class HUD {
     const vox = container.getObjectByName('singleSceneVoxels');
     const res = this.getSingleSceneRes();
 
-    if (state.vox && (!vox || forceRebuild)) await this._rebuildSingleSceneVoxels(res);
+    if (state.vox && (!vox || forceRebuild || viewer.voxelSettingsCurrent === false)) await this._rebuildSingleSceneVoxels(res);
     await viewer.setMinecraftEnabled(state.mc);
   }
 
@@ -323,6 +326,12 @@ class HUD {
   }
 
   switchToModel(modelType) {
+    const single = modelType === 'single-scene';
+    document.querySelector(single ? '#palette-minecraft-textures-slot' : '#map-minecraft-textures-slot').appendChild(document.querySelector('#minecraft-textures-control'));
+    document.querySelectorAll('.res-pill, #res-fine').forEach(control => { control.disabled = single; });
+    document.querySelector('#global-resolution-hint').textContent = single
+      ? 'Main map only. Single Scene uses its own metres-per-block or density controls; 1 m/block fixes the resolution at 1:1.'
+      : 'Main map voxel density. Updates the map automatically.';
     const singleScenePanel = document.querySelector('#single-scene-panel');
     const modelPickerBtn = document.querySelector('#model-picker-btn');
 
@@ -401,6 +410,7 @@ class HUD {
   }
 
   _initializeSingleSceneControls() {
+    document.querySelector('#map-minecraft-textures-slot').appendChild(document.querySelector('#minecraft-textures-control'));
     const fetchBtn = document.querySelector('#single-scene-fetch');
     const downloadBtn = document.querySelector('#single-scene-download');
     const debugTilesToggle = document.querySelector('#single-scene-debug-tiles');
@@ -414,6 +424,147 @@ class HUD {
     const sseValue = document.querySelector('#single-scene-sse-value');
     const radiusValue = document.querySelector('#single-scene-radius-value');
     const rotValue = document.querySelector('#single-scene-rot-value');
+    const scaleMode = document.querySelector('#single-scene-scale-mode');
+    const metersInput = document.querySelector('#single-scene-meters-per-block');
+    const scaleSummary = document.querySelector('#single-scene-scale-summary');
+    const markSettingsChanged = () => {
+      const viewer = window.singleSceneViewer;
+      if (!viewer) return;
+      this._ssVoxVersion = (this._ssVoxVersion ?? 0) + 1;
+      viewer._voxelController?.terminate();
+      viewer.exportSession.dispose();
+      viewer.voxelSettingsCurrent = false;
+    };
+    const updateScaleUI = () => {
+      const metric = scaleMode.value === 'metric';
+      metersInput.disabled = !metric;
+      document.querySelector('#single-scene-density-controls').classList.toggle('hidden', metric);
+      [resFine, resInput, ...resPills].forEach(el => { if (el) el.disabled = metric; });
+      scaleSummary.textContent = metric ? `1 block = ${metersInput.value} metre(s)` : 'Scale depends on tile density';
+    };
+    const rebuildScale = async () => {
+      markSettingsChanged();
+      if (scaleMode.value === 'metric' && !metersInput.checkValidity()) {
+        metersInput.reportValidity(); return;
+      }
+      updateScaleUI();
+      if (state.vox && window.singleSceneViewer?.tilesContainer) await this._rebuildSingleSceneVoxels(this.getSingleSceneRes());
+    };
+    scaleMode.addEventListener('change', rebuildScale);
+    metersInput.addEventListener('change', rebuildScale);
+    document.querySelector('#single-scene-rebuild').addEventListener('click', () => this._rebuildSingleSceneVoxels(this.getSingleSceneRes()));
+    updateScaleUI();
+    const paletteChecks = [...document.querySelectorAll('[data-block-palette]')];
+    const matchingSelect = document.querySelector('#single-scene-colour-matching');
+    const profileSelect = document.querySelector('#single-scene-colour-profile');
+    profileSelect.value = ['balanced', 'top', 'sides'].includes(localStorage.getItem('minecraftColourProfile')) ? localStorage.getItem('minecraftColourProfile') : 'balanced';
+    setBlockColourProfile(profileSelect.value);
+    matchingSelect.value = localStorage.getItem('minecraftBlockMatching') === 'fast' ? 'fast' : 'accurate';
+    setBlockMatchingMode(matchingSelect.value);
+    let paletteOptions = { ...DEFAULT_BLOCK_PALETTE };
+    let customNames = null;
+    try {
+      const saved = JSON.parse(localStorage.getItem('minecraftCustomBlocks') || 'null');
+      if (Array.isArray(saved) && saved.length && saved.length <= 10000 && saved.every(name => typeof name === 'string')) customNames = saved;
+    } catch {}
+    try { paletteOptions = normalizeBlockPalette(JSON.parse(localStorage.getItem('minecraftBlockPalette') || '{}')); } catch {}
+    configureBlockPalette(paletteOptions, customNames);
+    for (const check of paletteChecks) check.checked = paletteOptions[check.dataset.blockPalette];
+    let paletteChange = 0;
+    const updatePalette = async (save = true) => {
+      const version = ++paletteChange;
+      const status = document.querySelector('#single-scene-palette-status');
+      const options = Object.fromEntries(paletteChecks.map(check => [check.dataset.blockPalette, check.checked]));
+      if (!customNames && !Object.values(options).some(Boolean)) {
+        status.textContent = 'Keep at least one block family enabled.';
+        paletteChecks.find(check => check.dataset.blockPalette === 'wool').checked = true;
+        options.wool = true;
+      }
+      configureBlockPalette(options, customNames);
+      paletteChecks.forEach(check => { check.disabled = !!customNames; });
+      document.querySelector('#palette-reset').classList.toggle('hidden', !customNames);
+      setBlockMatchingMode(matchingSelect.value);
+      setBlockColourProfile(profileSelect.value);
+      if (save) localStorage.setItem('minecraftBlockPalette', JSON.stringify(options));
+      if (save) localStorage.setItem('minecraftBlockMatching', matchingSelect.value);
+      if (save) localStorage.setItem('minecraftColourProfile', profileSelect.value);
+      if (save) {
+        if (customNames) localStorage.setItem('minecraftCustomBlocks', JSON.stringify(customNames));
+        else localStorage.removeItem('minecraftCustomBlocks');
+      }
+      window.singleSceneViewer?.exportSession.dispose();
+      status.textContent = 'Updating block colour palette…';
+      try {
+        await initBlockData();
+        if (version !== paletteChange) return;
+        updateVis();
+        await window.singleSceneViewer?.setMinecraftEnabled(state.mc);
+        if (version !== paletteChange) return;
+        status.textContent = `${BLOCKS.length} blocks available; ${customNames ? 'custom list; ' : ''}${matchingSelect.value} matching; falling blocks excluded`;
+        if (save) this._logSingleScene(`Palette updated: ${BLOCKS.length} blocks. Existing voxel geometry reused.`);
+        return true;
+      } catch (error) { if (version === paletteChange) status.textContent = `Palette error: ${error.message}`; return false; }
+    };
+    paletteChecks.forEach(check => check.addEventListener('change', () => updatePalette()));
+    matchingSelect.addEventListener('change', () => updatePalette());
+    profileSelect.addEventListener('change', () => updatePalette());
+    const fileStatus = document.querySelector('#palette-file-status');
+    const downloadPalette = (value, filename) => downloadExport(new TextEncoder().encode(JSON.stringify(value, null, 2) + '\n'), filename);
+    document.querySelector('#palette-export-all').addEventListener('click', async () => {
+      try {
+        await initBlockData();
+        const catalog = await getMinecraftBlockCatalog();
+        downloadPalette(exportBlockCatalog(catalog, BLOCKS.map(block => block.name)), 'minecraft-block-list.json');
+        fileStatus.textContent = `Exported ${catalog.length} registered block IDs. Edit enabled flags, then import to apply.`;
+      } catch (error) { fileStatus.textContent = `Export failed: ${error.message}`; }
+    });
+    document.querySelector('#palette-export-selected').addEventListener('click', async () => {
+      try {
+        await initBlockData();
+        downloadPalette(BLOCKS.map(block => `minecraft:${block.name}`), 'minecraft-selected-blocks.json');
+        fileStatus.textContent = `Exported ${BLOCKS.length} selected block IDs.`;
+      } catch (error) { fileStatus.textContent = `Export failed: ${error.message}`; }
+    });
+    const importFile = document.querySelector('#palette-import-file');
+    let importVersion = 0;
+    document.querySelector('#palette-all-solids').addEventListener('click', async () => {
+      const version = ++importVersion;
+      try {
+        const catalog = await getMinecraftBlockCatalog();
+        if (version !== importVersion) return;
+        const names = catalog.filter(block => block.supported && block.fullCube && block.opaque).map(block => block.name);
+        customNames = names;
+        const applied = await updatePalette();
+        if (version !== importVersion) return;
+        if (!applied) throw new Error('Palette update did not complete.');
+        fileStatus.textContent = `Using all ${names.length} opaque solid blocks from Minecraft 26.3. Falling blocks excluded.`;
+      } catch (error) { fileStatus.textContent = `Could not apply solid-block preset: ${error.message}`; }
+    });
+    document.querySelector('#palette-import').addEventListener('click', () => importFile.click());
+    importFile.addEventListener('change', async () => {
+      const file = importFile.files?.[0]; if (!file) return;
+      const version = ++importVersion;
+      const previous = customNames;
+      try {
+        if (file.size > 2 * 1024 * 1024) throw new Error('Palette files must be smaller than 2 MiB.');
+        const parsed = parseBlockPalette(await file.text(), await getMinecraftBlockCatalog());
+        if (version !== importVersion) return;
+        customNames = parsed.names;
+        const applied = await updatePalette();
+        if (version !== importVersion) return;
+        if (!applied) {
+          customNames = previous; await updatePalette();
+          throw new Error('Could not apply the imported list; the previous palette was restored.');
+        }
+        fileStatus.textContent = `Imported ${parsed.names.length} blocks. ${parsed.ignored.length} unsupported or excluded entries skipped.${parsed.ignored.length ? ' Examples: ' + parsed.ignored.slice(0, 3).map(entry => `${entry.name} (${entry.reason})`).join('; ') : ''}`;
+      } catch (error) { fileStatus.textContent = `Import failed: ${error.message}`; }
+      finally { importFile.value = ''; }
+    });
+    document.querySelector('#palette-reset').addEventListener('click', () => {
+      importVersion++; customNames = null; void updatePalette();
+      fileStatus.textContent = 'Using block family selections again.';
+    });
+    void updatePalette(false);
 
     // Unhide rows if present (SSE + Debug)
     document.querySelector('#single-scene-sse-row')?.classList.remove('hidden');
@@ -476,10 +627,13 @@ class HUD {
     const clampRadiusValue = (raw) => {
       const num = parseFloat(raw);
       if (!Number.isFinite(num)) return 0;
-      return Math.max(0, Math.min(3000, num));
+      return Math.max(20, Math.min(20000, num));
     };
 
-    bindSliderToNumericInput(sseSlider, sseValue, { min: 2, max: 64 });
+    bindSliderToNumericInput(sseSlider, sseValue, { min: .1, max: 64 });
+    document.querySelector('#single-scene-max-detail').addEventListener('change', event => {
+      sseSlider.disabled = sseValue.disabled = event.target.checked;
+    });
     bindSliderToNumericInput(radiusSlider, radiusValue, { valueClamp: clampRadiusValue });
     bindSliderToNumericInput(rotSlider, rotValue, { min: 0, max: 360 });
 
@@ -509,6 +663,7 @@ class HUD {
     };
     const applyResolutionChange = async (value, { rebuild = true } = {}) => {
       const res = updateResolutionUI(value);
+      if (rebuild) markSettingsChanged();
       if (rebuild && state.vox && window.singleSceneViewer?.tilesContainer) {
         await this._rebuildSingleSceneVoxels(res);
       }
@@ -519,6 +674,7 @@ class HUD {
     // Rotation slider updates (number inputs dispatch events through slider binding)
     if (rotSlider) {
       rotSlider.addEventListener('input', async () => {
+        markSettingsChanged();
         if (state.vox && window.singleSceneViewer?.tilesContainer) {
           await this._rebuildSingleSceneVoxels(this.getSingleSceneRes());
         }
@@ -541,6 +697,7 @@ class HUD {
       }, 200);
 
       resFine.addEventListener('input', e => {
+        markSettingsChanged();
         const res = updateResolutionUI(e.target.value);
         debouncedRebuild(res);
       });
@@ -580,7 +737,7 @@ class HUD {
         }
 
         // Get SSE from the slider (default 20)
-        const sse = sseInput ? parseInt(sseInput.value) || 20 : 20;
+        const sse = document.querySelector('#single-scene-max-detail').checked ? 0 : Number(sseInput?.value || 1);
 
         // Radius in meters (controls how large an area to fetch)
         const radiusM = radiusSlider ? clampRadiusValue(radiusSlider.value) : 500;
@@ -594,15 +751,18 @@ class HUD {
         }
 
         try {
+          const capture = this._singleSceneCaptureNumber = (this._singleSceneCaptureNumber ?? 0) + 1;
+          const started = performance.now();
+          const captureLog = message => this._logSingleScene(`[Capture ${capture} +${((performance.now() - started) / 1000).toFixed(1)}s] ${message}`);
           fetchBtn.disabled = true;
           fetchBtn.textContent = 'Fetching...';
           this._showSingleSceneLog();
-          this._logSingleScene('Fetching tiles...');
+          captureLog('Starting source tile discovery…');
 
           if (!this._singleSceneFetcher) this._singleSceneFetcher = new SingleSceneFetcher();
           const serverUrl = getActiveServerUrl(apiKey);
           // zoom auto-computed from radius; pass null for zoom and provide radiusM
-          const urls = await this._singleSceneFetcher.fetch3DTiles(lat, lon, null, sse, apiKey, this._logSingleScene.bind(this), radiusM, serverUrl);
+          const urls = await this._singleSceneFetcher.fetch3DTiles(lat, lon, null, sse, apiKey, captureLog, radiusM, serverUrl);
 
           if (urls.length === 0) {
             this._logSingleScene('No tiles found for this location');
@@ -610,11 +770,15 @@ class HUD {
           }
 
           // Load the tiles into the existing viewer
+          fetchBtn.textContent = 'Downloading/decoding…';
           if (window.singleSceneViewer) {
-            await window.singleSceneViewer.loadGLTFTiles(urls, this._logSingleScene.bind(this));
+            await window.singleSceneViewer.loadGLTFTiles(urls, captureLog);
+            window.singleSceneViewer.captureLog = captureLog;
+            window.singleSceneViewer.captureMetadata = { latitude: lat, longitude: lon, radiusMeters: radiusM, sse };
           }
 
           // Mirror global Vox/MC state into Single Scene and pre-bake if needed
+          fetchBtn.textContent = 'Voxelizing…';
           await this.syncSingleSceneToGlobalVoxState(true);
 
           // Show tile controls and enable voxels toggle
@@ -750,17 +914,18 @@ class HUD {
       const viewer = window.singleSceneViewer;
       const vgrid = viewer?.voxelizer?._voxelGrid;
       if (!viewer || !vgrid) { this._logSingleScene('❌ No voxel grid to export'); return; }
+      if (viewer.voxelSettingsCurrent === false) { this._logSingleScene('Wait for the current scale and rotation preview to finish before exporting.'); return; }
 
       try {
         exportBtn.disabled = true;
         exportBtn.textContent = 'Preparing…';
         const fmt = exportFmt.value;
         const bytes = await viewer.exportSession.run(vgrid, fmt, text => this._logSingleScene(text));
-        downloadExport(bytes, `structure.${fmt}`);
+        downloadExport(bytes, fmt === 'schem-zip' ? 'voxel-earth-tiles.zip' : `structure.${fmt}`);
         this._logSingleScene(`Exported .${fmt}`);
       } catch (e) {
         console.error(e);
-        this._logSingleScene('❌ Export failed');
+        this._logSingleScene(`❌ Export failed: ${e.message}`);
       } finally { exportBtn.textContent = 'Export'; applyComplianceState(); }
     });
 
@@ -886,10 +1051,19 @@ class HUD {
     const viewer = window.singleSceneViewer;
     const container = viewer?.tilesContainer;
     if (!viewer || !container) { this._logSingleScene('? No tiles loaded'); return; }
-    const rotDeg = parseInt(document.querySelector('#single-scene-rot')?.value || '0', 10) || 0; // degrees to sample at
+    const rotDeg = Number(document.querySelector('#single-scene-rot')?.value || 0);
+    const metric = document.querySelector('#single-scene-scale-mode')?.value === 'metric';
+    const metersPerBlock = Number(document.querySelector('#single-scene-meters-per-block')?.value);
+    if (metric && (!Number.isFinite(metersPerBlock) || metersPerBlock < .1 || metersPerBlock > 100)) {
+      viewer.voxelSettingsCurrent = false;
+      this._logSingleScene('Metres per block must be between 0.1 and 100.'); return;
+    }
+    viewer.voxelSettingsCurrent = false;
 
     this._ssVoxVersion = (this._ssVoxVersion ?? 0) + 1;
     const myVersion = this._ssVoxVersion;
+    const started = performance.now();
+    const log = message => (viewer.captureLog ?? this._logSingleScene.bind(this))(`[Voxel ${myVersion} +${((performance.now() - started) / 1000).toFixed(1)}s] ${message}`);
 
     viewer._voxelController?.terminate();
     // Keep the previous preview until the replacement is ready. Serialize only
@@ -918,26 +1092,43 @@ class HUD {
     const densitySetting = Math.max(1, Number(resolution) || 64);
     const tilesAcross = Math.max(1, maxDim / tileDiag);
     const computedResolution = Math.max(8, Math.round(densitySetting * tilesAcross));
-    const approxVoxelMeters = tileDiag / densitySetting;
-    this._logSingleScene(`?? (Re)voxelizing @ ${computedResolution} (~${approxVoxelMeters.toFixed(2)} m voxels per tile).`);
+    const viewerMeters = viewer.metersPerViewerUnit;
+    const exactVoxelSize = metric ? metersPerBlock / viewerMeters : null;
+    if (metric && (!Number.isFinite(exactVoxelSize) || exactVoxelSize <= 0)) {
+      this._logSingleScene('Metric scale is unavailable. Fetch the tiles again.'); return;
+    }
+    log(metric ? `Voxelizing at exactly ${metersPerBlock} metre(s) per block, rotation ${rotDeg}°…`
+      : `Voxelizing at density ${densitySetting}, rotation ${rotDeg}°…`);
 
     let vox;
+    let lastStage = 'Preparing source geometry';
+    const heartbeat = setInterval(() => {
+      if (myVersion === this._ssVoxVersion && !viewer.destroyed) log(`Still working: ${lastStage}`);
+    }, 3000);
     try {
       vox = await voxelizeModel({
         model: source,
         renderer: viewer.renderer,
         scene: viewer.scene,
         resolution: computedResolution,
+        voxelSize: exactVoxelSize,
         needGrid: true,
         renderMode: 'packed',
         method: getActiveVoxelMethod(),
-        onStart: controller => { viewer._voxelController = controller; },
+        onStart: controller => {
+          if (myVersion !== this._ssVoxVersion || viewer.destroyed || viewer.tilesContainer !== container) controller.terminate();
+          else viewer._voxelController = controller;
+        },
+        onProgress: message => {
+          if (myVersion !== this._ssVoxVersion || viewer.destroyed) return;
+          lastStage = message; log(message);
+        },
         preRotateYDeg: rotDeg
       });
     } catch (e) {
-      this._logSingleScene(`? Voxelization error: ${e?.message || e}`);
+      if (myVersion === this._ssVoxVersion) log(`Voxelization failed: ${e?.message || e}`);
       return;
-    }
+    } finally { clearInterval(heartbeat); }
 
     if (vox?.stats?.fallbackReason) {
       this._logSingleScene(`? ${vox.stats.fallbackReason}`);
@@ -960,22 +1151,20 @@ class HUD {
     }
     const voxelMesh = vox.voxelMesh;
     const rawGrid = vox._voxelGrid; // original grid in the mesh’s creation frame
+    if (rawGrid) rawGrid.exportMetadata = {
+      ...viewer.captureMetadata,
+      metersPerBlock: metric ? metersPerBlock : rawGrid.unit.x * viewerMeters,
+      scaleMode: metric ? 'metric' : 'density', rotationDegrees: rotDeg,
+      rotationConvention: 'Positive Y rotation: east turns toward north; north turns toward west.',
+    };
 
     // Preserve original vertex-color material BEFORE any MC swap
     voxelMesh.traverse(n => { if (n.isMesh && !n.userData.origMat) n.userData.origMat = n.material; });
 
-    // Prepare counter-rotation so only sampling orientation changes
-    const pivot = containerBox.getCenter(new THREE.Vector3());
-    const Tneg = new THREE.Matrix4().makeTranslation(-pivot.x, -pivot.y, -pivot.z);
-    const RyInv = new THREE.Matrix4().makeRotationY(THREE.MathUtils.degToRad(-rotDeg));
-    const Tpos = new THREE.Matrix4().makeTranslation(pivot.x, pivot.y, pivot.z);
-    const counterM = new THREE.Matrix4().multiplyMatrices(Tpos, new THREE.Matrix4().multiplyMatrices(RyInv, Tneg));
-
-    // world -> container-local + attach (after counter-rotation)
+    // Keep the preview in the same rotated frame as the Minecraft export.
+    // Only undo the viewer container transform when attaching the worker mesh.
     const inv = new THREE.Matrix4().copy(container.matrixWorld).invert();
-    // Combined matrix that we apply to geometry; use same to rebase voxelGrid
-    const Mreb = new THREE.Matrix4().multiplyMatrices(inv, counterM);
-    voxelMesh.applyMatrix4(Mreb);
+    voxelMesh.applyMatrix4(inv);
     voxelMesh.traverse(node => node.layers.set(1));
 
     voxelMesh.matrixAutoUpdate = false;
@@ -989,7 +1178,9 @@ class HUD {
     try { voxelMesh.updateMatrixWorld(true); } catch { }
     viewer.voxelMeshes = [voxelMesh];
     viewer.voxelizer = vox;
+    viewer.voxelSettingsCurrent = true;
 
+    log('Preparing Minecraft materials…');
     await viewer.setMinecraftEnabled(state.mc);
 
     // Materials already set earlier; no additional MC swap here
@@ -997,7 +1188,11 @@ class HUD {
     // Respect global voxel visibility
     this._setSingleSceneVisibility(!!state.vox);
 
-    this._logSingleScene(`✅ Voxels ready (${vox.voxelCount ?? '—'}) @ ${resolution}`);
+    const dims = rawGrid?.gridSize;
+    const summary = dims ? `${dims.x} × ${dims.y} × ${dims.z} blocks; ${rawGrid.exportMetadata.metersPerBlock.toFixed(3)} m/block; ${rotDeg}°` : 'Preview ready';
+    document.querySelector('#single-scene-scale-summary').textContent = summary;
+    log(`✅ ${vox.voxelCount ?? '—'} occupied blocks. ${summary}`);
+    if (vox.stats) log(`Stage timings: geometry ${(vox.stats.bakeMs / 1000).toFixed(1)}s; raster ${(vox.stats.rasterMs / 1000).toFixed(1)}s; colours/mesh ${(vox.stats.meshMs / 1000).toFixed(1)}s; export grid ${(vox.stats.gridExportMs / 1000).toFixed(1)}s`);
   }
 
   _initializeBasicElements() {
@@ -1192,7 +1387,9 @@ class HUD {
           localStorage.setItem('voxelMethod', e.target.value);
           console.log('Voxelization method changed to:', e.target.value);
           // Always trigger rebuild when method changes (user wants to see the difference)
-          if (state.vox) {
+          if (window.singleSceneViewer?.tilesContainer) {
+            this._rebuildSingleSceneVoxels(this.getSingleSceneRes());
+          } else if (state.vox) {
             rebuildAll();
           }
         }
@@ -2306,13 +2503,14 @@ window.MC_setBrightness = b => rebakeMinecraftUVsForVisibleTiles(b);
 
 function preparePackedMinecraft() {
   const bias = getMinecraftBrightnessBias();
-  if (packedMinecraftResources?.bias === bias) {
+  const paletteKey = getBlockPaletteKey();
+  if (packedMinecraftResources?.bias === bias && packedMinecraftResources?.paletteKey === paletteKey) {
     // Returning to the active bias supersedes any unfinished replacement.
     pendingMinecraftResources = null;
     return;
   }
-  if (pendingMinecraftResources?.bias === bias) return;
-  const request = { bias };
+  if (pendingMinecraftResources?.bias === bias && pendingMinecraftResources?.paletteKey === paletteKey) return;
+  const request = { bias, paletteKey };
   pendingMinecraftResources = request;
   getPackedBlockResources(bias).then(resources => {
     if (pendingMinecraftResources !== request) { resources.lookup.dispose(); return; }

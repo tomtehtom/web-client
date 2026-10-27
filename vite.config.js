@@ -23,10 +23,12 @@ export default defineConfig({
   },
 
   optimizeDeps: {
+    include: ['three/addons/utils/BufferGeometryUtils.js'],
     esbuildOptions: { target: 'es2020' }
   },
 
 server: {
+  watch: { ignored: ['**/output/**'] },
   allowedHosts: true,
   proxy: {
     '/earth-tiles': {

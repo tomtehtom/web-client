@@ -111,8 +111,9 @@ function boundingVolumeToSphere(volume) {
 }
 
 export class SingleSceneFetcher {
-  constructor({ concurrency = typeof matchMedia !== 'undefined' && matchMedia('(pointer: coarse)').matches ? 3 : 6 } = {}) {
+  constructor({ concurrency = typeof matchMedia !== 'undefined' && matchMedia('(pointer: coarse)').matches ? 3 : 6, progressIntervalMs = 2000 } = {}) {
     this.concurrency = Math.max(1, concurrency);
+    this.progressIntervalMs = progressIntervalMs;
   }
 
   async fetch3DTiles(lat, lng, zoom, targetScreenSpaceError, apiKey, logFn, radiusMeters, rootUrlString) {
@@ -125,12 +126,15 @@ export class SingleSceneFetcher {
       let active = 0;
       const waiters = [];
       const controller = new AbortController();
+      const started = performance.now();
+      const stats = { completed: 0, nodes: 0, models: new Set() };
+      const report = () => logFn?.(`Discovering tiles: ${stats.completed} tileset requests complete; ${active} active, ${waiters.length} queued; ${stats.nodes} nodes checked; ${stats.models.size} model tiles found; ${((performance.now() - started) / 1000).toFixed(1)}s elapsed`);
       const sessionRef = { signal: controller.signal, visited: new Set(), limit: async fn => {
         if (active >= this.concurrency) await new Promise(resolve => waiters.push(resolve));
         else active++;
         try { controller.signal.throwIfAborted(); return await fn(); }
-        finally { if (waiters.length) waiters.shift()(); else active--; }
-      } };
+        finally { stats.completed++; if (waiters.length) waiters.shift()(); else active--; }
+      }, stats };
       const urls = [];
       const rootUrl = rootUrlString ? new URL(rootUrlString) : new URL('https://tile.googleapis.com/v1/3dtiles/root.json');
 
@@ -141,10 +145,12 @@ export class SingleSceneFetcher {
 
       rootUrl.searchParams.delete('session');
 
-      logFn?.(`Fetching tiles within ${radius.toFixed(0)} m, SSE ${targetScreenSpaceError}`);
+      logFn?.(`Discovering source tiles within ${radius.toFixed(0)} m, ${targetScreenSpaceError === 0 ? 'highest available detail' : `geometric error threshold ${targetScreenSpaceError} m`}`);
+      const heartbeat = logFn ? setInterval(report, this.progressIntervalMs) : null;
 
       try {
         await this._walkTileset(rootUrl, regionSphere, apiKey, sessionRef, targetScreenSpaceError, urls, logFn, 0);
+        report();
       } catch (error) {
         controller.abort();
         if (error.status === 400 && attempt === 0) {
@@ -152,8 +158,8 @@ export class SingleSceneFetcher {
           continue;
         }
         throw error;
-      }
-      logFn?.(`Found ${urls.length} tile(s).`);
+      } finally { clearInterval(heartbeat); }
+      logFn?.(`Found ${stats.models.size} model tile(s) in ${((performance.now() - started) / 1000).toFixed(1)}s. Starting model downloads/decoding next.`);
       return [...new Set(urls)];
     }
   }
@@ -189,12 +195,13 @@ export class SingleSceneFetcher {
 
   async _walkNode(node, baseUrl, regionSphere, apiKey, sessionRef, targetSSE, urls, logFn, depth) {
     if (!node || urls.length >= MAX_TILE_RESULTS) return;
+    sessionRef.stats.nodes++;
     const boundingSphere = boundingVolumeToSphere(node.boundingVolume);
     if (boundingSphere && !regionSphere.intersects(boundingSphere)) return;
 
     const error = Number.isFinite(node.geometricError) ? node.geometricError : 0;
     const hasChildren = Array.isArray(node.children) && node.children.length > 0;
-    const shouldRefine = hasChildren && error > targetSSE;
+    const shouldRefine = hasChildren && (targetSSE === 0 || error > targetSSE);
 
     if (shouldRefine) {
       const branches = await Promise.all(node.children.map(async child => {
@@ -265,6 +272,7 @@ export class SingleSceneFetcher {
 
     if (isGltf) {
       urls.push(href);
+      sessionRef.stats.models.add(href);
       return;
     }
 

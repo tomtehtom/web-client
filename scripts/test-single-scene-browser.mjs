@@ -8,7 +8,8 @@ const report = { browser: name, errors: [], layouts: [] };
 let server, browser;
 try {
   server = await createServer({ server: { host: '127.0.0.1', port: 0, open: false } }); await server.listen();
-  browser = await (name === 'webkit' ? webkit : chromium).launch({ headless: false, ...(name === 'webkit' ? {} : { channel: name }) });
+  browser = await (name === 'webkit' ? webkit : chromium).launch({ headless: process.env.VOXEL_HEADLESS === '1', ...(name === 'webkit' ? {} : { channel: name }),
+    args: process.env.VOXEL_SOFTWARE_GL ? ['--use-angle=swiftshader', '--enable-unsafe-swiftshader'] : [] });
   const page = await browser.newPage({ viewport: { width: 390, height: 844 }, deviceScaleFactor: 3, isMobile: true, hasTouch: true, serviceWorkers: 'block' });
   page.setDefaultTimeout(30000);
   page.on('pageerror', e => report.errors.push(e.message));
@@ -33,9 +34,10 @@ try {
     const data = await new GLTFExporter().parseAsync(scene, { binary: true });
     const url = URL.createObjectURL(new Blob([data]));
     await window.singleSceneViewer.loadGLTFTiles([url]); URL.revokeObjectURL(url);
+    const mode = document.querySelector('#single-scene-scale-mode'); mode.value = 'density'; mode.dispatchEvent(new Event('change'));
     const input = document.querySelector('#single-scene-res-fine'); input.value = '32'; input.dispatchEvent(new Event('input'));
   });
-  await page.waitForFunction(() => window.singleSceneViewer.voxelizer?.voxelMesh);
+  await page.waitForFunction(() => window.singleSceneViewer.voxelMeshes[0]?.userData.resolution === 32 && window.singleSceneViewer.voxelSettingsCurrent);
   report.preview = await page.evaluate(() => {
     const v = window.singleSceneViewer;
     window.originalSingleMesh = v.voxelMeshes[0];
@@ -46,12 +48,17 @@ try {
   });
   assert.ok(report.preview.packed && report.preview.sparseGrid && !report.preview.gridDense);
   assert.equal(report.preview.pixelRatio, 1);
+  if (process.env.VOXEL_FACE_FIXTURE) {
+    await page.locator('#palette-import-file').setInputFiles({ name: 'grass.json', mimeType: 'application/json', buffer: Buffer.from('["minecraft:grass_block"]') });
+    await page.waitForFunction(() => document.querySelector('#single-scene-palette-status').textContent.startsWith('1 blocks'));
+    report.faceFixture = 'grass_block';
+  }
   // Mobile users must reach rendering options without the hidden footer.
   await page.locator('#single-scene-options').tap();
+  await page.locator('#menu-close').tap();
   await page.locator('label').filter({ has: page.locator('#toggle-mc') }).tap();
   await page.waitForFunction(() => window.singleSceneViewer.voxelMeshes[0].userData.__mcApplied);
   await page.locator('label').filter({ has: page.locator('#toggle-mc') }).tap();
-  await page.locator('#menu-close').tap();
   const distance = () => page.evaluate(() => {
     const v = window.singleSceneViewer; return v.camera.position.distanceTo(v.controls.target);
   });
@@ -62,7 +69,7 @@ try {
   const beforeTilt = await page.evaluate(() => window.singleSceneViewer.camera.position.toArray());
   await page.locator('#tilt-up-btn').tap();
   assert.notDeepEqual(await page.evaluate(() => window.singleSceneViewer.camera.position.toArray()), beforeTilt);
-  // Rapid sampling-rotation changes cancel obsolete work and keep the old mesh
+  // Rapid rotation changes cancel obsolete work and keep the old mesh
   // attached until the latest replacement is ready.
   await page.evaluate(() => {
     const input = document.querySelector('#single-scene-rot');
@@ -104,9 +111,20 @@ try {
           camera.position.copy(center); camera.position.setComponent(axis, center.getComponent(axis) + sign * span * 2);
           camera.up.set(0, axis === 1 ? 0 : 1, axis === 1 ? 1 : 0); camera.lookAt(center); camera.updateMatrixWorld(true);
           const a = pixels(v.scene), b = pixels(gltf.scene);
-          let mismatches = 0;
-          for (let i = 0; i < a.length; i += 4) if ([0, 1, 2].some(c => Math.abs(a[i + c] - b[i + c]) > 2)) mismatches++;
-          results.texturePixels.push({ axis, sign, mismatches });
+          let mismatches = 0, unmatchedMismatches = 0;
+          for (let i = 0; i < a.length; i += 4) if ([0, 1, 2].some(c => Math.abs(a[i + c] - b[i + c]) > 2)) {
+            mismatches++;
+            const x = (i / 4) % 257, y = Math.floor(i / (4 * 257));
+            let neighborMatch = false;
+            for (let dy = -1; dy <= 1; dy++) for (let dx = -1; dx <= 1; dx++) {
+              const px = x + dx, py = y + dy;
+              if (px < 0 || py < 0 || px >= 257 || py >= 257) continue;
+              const at = (px + py * 257) * 4;
+              if ([0, 1, 2].every(c => Math.abs(a[i + c] - b[at + c]) <= 2)) neighborMatch = true;
+            }
+            if (!neighborMatch) unmatchedMismatches++;
+          }
+          results.texturePixels.push({ axis, sign, mismatches, unmatchedMismatches });
         }
         v.renderer.setRenderTarget(null); target.dispose();
       }
@@ -116,16 +134,18 @@ try {
     for (const format of ['nbt', 'schem', 'schematic', 'mcfunction']) {
       console.log('EXPORT TEST', format);
       const start = performance.now();
-      const bytes = await v.exportSession.run(v.voxelizer._voxelGrid, format);
+      const result = await v.exportSession.run(v.voxelizer._voxelGrid, format);
+      const bytes = result.fileParts ? new Uint8Array(await new Blob(result.fileParts).arrayBuffer()) : result;
       results[format] = { bytes: bytes.byteLength, ms: performance.now() - start, header: [...bytes.slice(0, 10)] };
     }
     return results;
   })(), new Promise((_, reject) => setTimeout(() => reject(new Error('Export test timed out')), 25000))]));
   assert.ok(report.exports.sameMesh);
   assert.ok(report.exports.texturedGlb.texturedMeshes > 0);
+  if (process.env.VOXEL_FACE_FIXTURE) assert.ok(report.exports.texturedGlb.texturedMeshes > 1, 'Grass top/side/bottom must use distinct exported face materials');
   // glTF's float32 transforms can select the neighboring nearest texel at a
   // rotated edge; allow under 0.1% of pixels, while catching UV/material changes.
-  assert.ok(report.exports.texturePixels.every(v => v.mismatches < 257 * 257 * .001), JSON.stringify(report.exports.texturePixels));
+  assert.ok(report.exports.texturePixels.every(v => v.mismatches < 257 * 257 * .001 && v.unmatchedMismatches < 257 * 257 * .0002), JSON.stringify(report.exports.texturePixels));
   assert.deepEqual(report.exports.coloredGlb.bounds, report.exports.texturedGlb.bounds);
   assert.equal(report.exports.coloredGlb.triangles, report.exports.texturedGlb.triangles);
   for (const fmt of ['nbt', 'schem', 'schematic']) assert.deepEqual(report.exports[fmt].header.slice(0, 2), [31, 139]);
@@ -170,6 +190,7 @@ try {
   await page.locator('#model-picker-btn').tap();
   console.log('EXPORT TEST menu', await page.locator('#model-picker-menu').getAttribute('class'));
   await page.locator('[data-model="voxel-earth"]').tap();
+  assert.equal(await page.locator('#map-minecraft-textures-slot #toggle-mc').count(), 1);
   await page.evaluate(() => { window.closedSingleFrame = window.closedSingleViewer.renderer.info.render.frame; });
   await page.waitForTimeout(100);
   assert.equal(await page.evaluate(() => window.closedSingleViewer.renderer.info.render.frame), await page.evaluate(() => window.closedSingleFrame));

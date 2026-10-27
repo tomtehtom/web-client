@@ -2,6 +2,8 @@
 // Drop‑in upgrade: shared atlas + OKLab + color cache (no 960px assumptions)
 
 import * as THREE from 'three';
+import { MINECRAFT_DATA_VERSION } from './minecraft-version.js';
+import { DEFAULT_BLOCK_PALETTE, normalizeBlockPalette, blockAllowedByPalette, isGravityBlock } from './block-palette.js';
 // Browser-safe NBT shim (pure JS). Provides write()/writeUncompressed().
 import * as _nbt from './nbt.js';
 const NBT = _nbt;
@@ -19,6 +21,20 @@ let VANILLA_ATLAS = null;
 const textureCache = {};
 let BLOCKS = [];
 let kdTree = null;
+let paletteOptions = { ...DEFAULT_BLOCK_PALETTE };
+let customBlockNames = null;
+let colourProfile = 'balanced';
+export function setBlockColourProfile(profile) { colourProfile = ['balanced', 'top', 'sides'].includes(profile) ? profile : 'balanced'; }
+export function getBlockColourProfile() { return colourProfile; }
+let blockMatchingMode = 'accurate';
+export function getBlockMatchingMode() { return blockMatchingMode; }
+export function setBlockMatchingMode(mode) { blockMatchingMode = mode === 'fast' ? 'fast' : 'accurate'; }
+export function getBlockPaletteKey() { return JSON.stringify([paletteOptions, blockMatchingMode, colourProfile, customBlockNames ? [...customBlockNames].sort() : null]); }
+export function configureBlockPalette(options, customNames = null) {
+  paletteOptions = normalizeBlockPalette(options);
+  customBlockNames = customNames ? new Set(customNames.map(name => name.replace(/^minecraft:/, ''))) : null;
+  BLOCKS = []; kdTree = null;
+}
 
 // Bias towards brighter/darker blocks during matching (OKLab L adjustment)
 // Recommended external usage range: -0.20 .. +0.20
@@ -39,7 +55,6 @@ let BLOCK_DENY = [
   /coral/,                             // any coral block/fan
   /^birch_log$/,                       // birch wood
   /^glowstone$/,                       // glowstone
-  /_glazed_terracotta$/,               // all glazed terracotta (incl. the blue/orange ones)
 
   // transparent & see-through
   /(^|_)glass(_|$)/,          // glass, stained_glass, tinted_glass
@@ -139,6 +154,25 @@ async function loadVanillaAtlas() {
   const resp = await fetch('/vanilla.atlas');
   if (!resp.ok) throw new Error(`HTTP ${resp.status}: ${resp.statusText}`);
   VANILLA_ATLAS = await resp.json();
+}
+
+let blockRegistry = null;
+export async function getMinecraftBlockCatalog() {
+  await loadVanillaAtlas();
+  if (!blockRegistry) {
+    const response = await fetch('/minecraft-block-registry.json');
+    if (!response.ok) throw new Error(`Could not load block catalog (HTTP ${response.status}).`);
+    blockRegistry = await response.json();
+  }
+  const atlasBlocks = new Set(VANILLA_ATLAS.blocks.map(block => block.name));
+  return blockRegistry.blocks.map(name => {
+    const raw = name.replace(/^minecraft:/, '');
+    const metadata = blockRegistry.details?.[name];
+    const reason = isGravityBlock(raw) ? 'Falling or support-dependent block excluded'
+      : metadata?.supported === false ? metadata.reason
+      : !VANILLA_ATLAS.textures?.[`minecraft:block/${raw}`] || !atlasBlocks.has(name) ? 'No supported texture in the bundled atlas' : null;
+    return { name, supported: !reason, fullCube: metadata?.fullCube ?? false, opaque: metadata?.opaque ?? false, ...(reason ? { reason } : {}) };
+  });
 }
 
 // Compute the 16×16 window (inside padded cell) for a block
@@ -260,7 +294,12 @@ function makeBlockMaterial(sharedAtlas, uv) {
  * 1) LOAD ATLAS, PREPARE BLOCKS WITH UV TRANSFORMS
  ******************************************************/
 async function loadAllBlocks() {
+  const paletteKey = getBlockPaletteKey();
+  const options = { ...paletteOptions };
+  const profile = colourProfile;
+  const custom = customBlockNames ? new Set(customBlockNames) : null;
   await loadVanillaAtlas();
+  const supported = new Set((await getMinecraftBlockCatalog()).filter(block => block.supported).map(block => block.name));
   const sharedAtlas = await getSharedAtlasTexture();
   const atlasImg = sharedAtlas.image;
   const atlasW = atlasImg.width;
@@ -273,18 +312,25 @@ async function loadAllBlocks() {
   // We only consider entries that also exist in textures map
   await Promise.all(blocks.map(async (b) => {
     const raw = b.name.replace('minecraft:', '');
+    if (!supported.has(`minecraft:${raw}`)) return;
     const atlasKey = `minecraft:block/${raw}`;
     const info = VANILLA_ATLAS.textures?.[atlasKey];
     if (!info) return; // skip things not mapped in the atlas
-    if (BLOCK_ALLOW && BLOCK_ALLOW.length && !_matches(raw, BLOCK_ALLOW)) return;
-    if (BLOCK_DENY && BLOCK_DENY.length && _matches(raw, BLOCK_DENY)) return;
+    if (isGravityBlock(raw)) return;
+    if (custom ? !custom.has(raw) : !blockAllowedByPalette(raw, options)) return;
+    if (!custom && BLOCK_ALLOW && BLOCK_ALLOW.length && !_matches(raw, BLOCK_ALLOW)) return;
+    if (!custom && BLOCK_DENY && BLOCK_DENY.length && _matches(raw, BLOCK_DENY)) return;
 
     // Compute 16×16 window and uv transform
     const win = atlasWindowFor(info, atlasW, atlasH, cells);
     const uv = uvTransformFromWindow(win, atlasW, atlasH);
 
     // Average color from the exact 16×16 we will sample
-    const rgb = meanColorFromAtlasRegion(atlasImg, win);
+    const rgb = b.colours?.[profile] ?? meanColorFromAtlasRegion(atlasImg, win);
+    const faceUvs = ['west', 'east', 'down', 'up', 'north', 'south'].map(face => {
+      const faceInfo = VANILLA_ATLAS.textures?.[b.faces?.[face]] ?? info;
+      return uvTransformFromWindow(atlasWindowFor(faceInfo, atlasW, atlasH, cells), atlasW, atlasH);
+    });
     const okl = USE_OKLAB ? rgbToOKLab(rgb.r, rgb.g, rgb.b) : null;
 
     out.push({
@@ -292,12 +338,15 @@ async function loadAllBlocks() {
       rgb,
       oklab: okl,
       uv,
+      faceUvs,
       // lazily create material per block when we actually build geometry
       material: null
     });
   }));
 
+  if (paletteKey !== getBlockPaletteKey()) return false;
   BLOCKS = out;
+  return true;
 }
 
 /*******************************************************
@@ -661,7 +710,7 @@ class ChunkedIntGrid {
  ******************************************************/
 export async function initBlockData() {
   if (BLOCKS.length && kdTree) return;
-  await loadAllBlocks();
+  if (!(await loadAllBlocks())) return initBlockData();
   if (!BLOCKS.length) {
     console.error('No blocks loaded from atlas.');
     return;
@@ -674,6 +723,8 @@ export async function initBlockData() {
 // Shared preview lookup: the same 5-6-5 color bins used by block assignment,
 // sampled at deterministic bin centers. Export retains its full grid path.
 export async function getPackedBlockResources(bias = MC_BRIGHTNESS_BIAS) {
+  const paletteKey = getBlockPaletteKey();
+  const matchingMode = blockMatchingMode;
   await initBlockData();
   if (!BLOCKS.length || !kdTree) throw new Error('Minecraft block palette is unavailable');
   const blocks = BLOCKS, tree = kdTree;
@@ -697,8 +748,7 @@ export async function getPackedBlockResources(bias = MC_BRIGHTNESS_BIAS) {
       const q = rgbToOKLab(((key & 31) + 0.5) / 32, (((key >> 5) & 63) + 0.5) / 64, ((key >> 11) + 0.5) / 32);
       q.L = Math.min(1, Math.max(0, q.L + bias));
       best.distance = Infinity; nearest(tree, q, best);
-      const uv = blocks[best.index].uv;
-      data.set([uv.offsetX, uv.offsetY, uv.repeatX, uv.repeatY], key * 4);
+      data.set([best.index, 0, 0, 0], key * 4);
       if ((key & 255) === 255 && performance.now() >= deadline) {
         await new Promise(resolve => setTimeout(resolve, 0)); deadline = performance.now() + 4;
       }
@@ -707,7 +757,22 @@ export async function getPackedBlockResources(bias = MC_BRIGHTNESS_BIAS) {
     lookup.minFilter = lookup.magFilter = THREE.NearestFilter;
     lookup.generateMipmaps = false; lookup.needsUpdate = true;
     lookup.userData.sharedVoxelResource = true;
-    return { lookup, atlas: await getSharedAtlasTexture(), bias };
+    const labs = new Float32Array(blocks.length * 4), rects = new Float32Array(blocks.length * 6 * 4);
+    blocks.forEach((block, i) => {
+      labs.set([block.oklab.L, block.oklab.a, block.oklab.b, 0], i * 4);
+      for (let face = 0; face < 6; face++) {
+        const rect = block.faceUvs?.[face] ?? block.uv;
+        rects.set([rect.offsetX, rect.offsetY, rect.repeatX, rect.repeatY], (i + blocks.length * face) * 4);
+      }
+    });
+    const paletteLab = new THREE.DataTexture(labs, blocks.length, 1, THREE.RGBAFormat, THREE.FloatType);
+    const paletteRects = new THREE.DataTexture(rects, blocks.length, 6, THREE.RGBAFormat, THREE.FloatType);
+    for (const texture of [paletteLab, paletteRects]) {
+      texture.minFilter = texture.magFilter = THREE.NearestFilter;
+      texture.generateMipmaps = false; texture.needsUpdate = true;
+    }
+    lookup.addEventListener('dispose', () => { paletteLab.dispose(); paletteRects.dispose(); });
+    return { lookup, paletteLab, paletteRects, paletteCount: blocks.length, matchingMode, atlas: await getSharedAtlasTexture(), bias, paletteKey };
   })();
   // The preview owner retains/disposes the lookup; the image atlas is borrowed.
   return entry.promise;
@@ -899,9 +964,10 @@ export { BLOCKS };
 export { getSharedAtlasTexture };
 
 // Worker-only palette snapshot; avoids image decoding and DOM APIs in exporters.
-export function setExportBlockPalette(blocks, bias = 0) {
+export function setExportBlockPalette(blocks, bias = 0, matchingMode = 'accurate') {
   BLOCKS = blocks;
   MC_BRIGHTNESS_BIAS = bias;
+  setBlockMatchingMode(matchingMode);
   buildBlockKDTree();
 }
 
@@ -1251,8 +1317,35 @@ export function restoreVoxelOriginalMaterial(voxelMesh) {
 }
 
 // ── EXPORT HELPERS ─────────────────────────────────────────────
-// Build a compact block grid (palette + indexed 3D array) from a voxelGrid.
-// Uses the same KD mapping as MC material assignment to ensure WYSIWYG.
+// Share the preview's color matching between dense and sparse export writers.
+export function createExportBlockMatcher(voxelGrid) {
+  const cache = new Int32Array(65536); cache.fill(-1);
+  const exactCache = new Map();
+  const accurate = blockMatchingMode === 'accurate';
+  return (r, g, b) => {
+    if (accurate) {
+      const key = `${r},${g},${b}`;
+      if (exactCache.has(key)) return exactCache.get(key);
+      const q = applyBrightnessBias(rgbToOKLab(r, g, b));
+      const index = nearestNeighbor(kdTree, q.L, q.a, q.b, { d2: Infinity, idx: -1 }).idx;
+      const name = index >= 0 ? BLOCKS[index]?.name : undefined;
+      if (exactCache.size >= 65536) exactCache.clear();
+      exactCache.set(key, name);
+      return name;
+    }
+    const key = Math.min(31, Math.max(0, (r * 32) | 0)) + 32 * (Math.min(63, Math.max(0, (g * 64) | 0)) + 64 * Math.min(31, Math.max(0, (b * 32) | 0)));
+    let bIdx = cache[key];
+    if (bIdx < 0) {
+      const q = applyBrightnessBias(voxelGrid.blockMatching === 'packed'
+        ? rgbToOKLab(((key & 31) + .5) / 32, (((key >> 5) & 63) + .5) / 64, ((key >> 11) + .5) / 32)
+        : rgbToOKLab(r, g, b));
+      bIdx = cache[key] = nearestNeighbor(kdTree, q.L, q.a, q.b, { d2: Infinity, idx: -1 }).idx;
+    }
+    return bIdx >= 0 ? BLOCKS[bIdx]?.name : undefined;
+  };
+}
+
+// Build a cropped dense volume for formats and tile writers that need one.
 export function buildBlockGrid(voxelGrid, { maxCells = 50_000_000 } = {}) {
   if (!voxelGrid) throw new Error('buildBlockGrid: voxelGrid required');
   // Two sparse passes avoid retaining both an intermediate block-index volume
@@ -1271,32 +1364,25 @@ export function buildBlockGrid(voxelGrid, { maxCells = 50_000_000 } = {}) {
   const total = Math.max(1, SX * SY * SZ);
   if (!Number.isSafeInteger(total) || total > maxCells) throw new Error('Export volume is too large for this device. Reduce capture radius or voxel density.');
   const palette = [];
-  const remap   = new Map(); // BLOCK index -> palette idx
+  const remap   = new Map(); // block name -> palette index
   const data    = new Int32Array(total);
   data.fill(-1);
-  const cache = new Int32Array(65536); cache.fill(-1);
+  const matchBlock = createExportBlockMatcher(voxelGrid);
 
   if (hasData) {
     iterateVoxelSamples(voxelGrid, ({ x, y, z, r, g, b }) => {
-      const key = Math.min(31, Math.max(0, (r * 32) | 0)) + 32 * (Math.min(63, Math.max(0, (g * 64) | 0)) + 64 * Math.min(31, Math.max(0, (b * 32) | 0)));
-      let bIdx = cache[key];
-      if (bIdx < 0) {
-        const q = applyBrightnessBias(voxelGrid.blockMatching === 'packed'
-          ? rgbToOKLab(((key & 31) + .5) / 32, (((key >> 5) & 63) + .5) / 64, ((key >> 11) + .5) / 32)
-          : rgbToOKLab(r, g, b));
-        bIdx = cache[key] = nearestNeighbor(kdTree, q.L, q.a, q.b, { d2: Infinity, idx: -1 }).idx;
-      }
-      if (bIdx < 0 || !BLOCKS[bIdx]) return;
+      const name = matchBlock(r, g, b);
+      if (!name) return;
       const lx = x - min.x;
       const ly = y - min.y;
       const lz = z - min.z;
       if (lx < 0 || ly < 0 || lz < 0 || lx >= SX || ly >= SY || lz >= SZ) return;
       const lin = lx + SX * (ly + SY * lz);
-      let p = remap.get(bIdx);
+      let p = remap.get(name);
       if (p === undefined) {
         p = palette.length;
-        palette.push(BLOCKS[bIdx].name);
-        remap.set(bIdx, p);
+        palette.push(name);
+        remap.set(name, p);
       }
       data[lin] = p;
     });
@@ -1522,7 +1608,7 @@ function encodeVarIntBlockData(metrics, data, paletteIds) {
 }
 
 // Java Structure Block .nbt (gzipped NBT)
-export async function writeStructureNBT(denseGrid, { dataVersion = 3955 } = {}) {
+export async function writeStructureNBT(denseGrid, { dataVersion = MINECRAFT_DATA_VERSION } = {}) {
   if (!denseGrid) throw new Error('writeStructureNBT: grid required');
   const { size, palette } = denseGrid;
   getGridMetrics(size, denseGrid.data, 'writeStructureNBT');
@@ -1552,7 +1638,7 @@ export async function writeStructureNBT(denseGrid, { dataVersion = 3955 } = {}) 
 }
 
 // Sponge WorldEdit .schem (v2) – dependency-free writer using prismarine-nbt
-export async function writeSpongeSchem(denseGrid, { dataVersion = 3955 } = {}) {
+export async function writeSpongeSchem(denseGrid, { dataVersion = MINECRAFT_DATA_VERSION } = {}) {
   if (!denseGrid) throw new Error('writeSpongeSchem: grid required');
   const { size, palette, data } = denseGrid;
   const paletteNames = Array.isArray(palette) ? palette : [];

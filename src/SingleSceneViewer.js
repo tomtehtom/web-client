@@ -7,7 +7,7 @@ import { MeshoptDecoder } from 'three/examples/jsm/libs/meshopt_decoder.module.j
 import { GLTFExporter } from 'three/addons/exporters/GLTFExporter.js';
 import { loadGltfBatch } from './loadGltfBatch.js';
 import { VoxelExportSession, makeExportGroup, downloadExport } from './voxel-export.js';
-import { getPackedBlockResources, getMinecraftBrightnessBias } from './assignToBlocksForGLB.js';
+import { getPackedBlockResources, getMinecraftBrightnessBias, getBlockPaletteKey } from './assignToBlocksForGLB.js';
 import { setPackedVoxelTextures } from './packed-voxel-renderer.js';
 import { renderPixelRatio } from './mobile-ui.js';
 
@@ -110,15 +110,27 @@ export class SingleSceneViewer {
 		}
 		const tilesContainer = new THREE.Object3D();
 		// Fetch individual glTFs with bounded parallelism instead of serial network waits
-		const { gltfs: gltfArray, stats } = await loadGltfBatch({
+		let latest = { loaded: 0, failed: 0 }, lastLog = 0;
+		const started = performance.now();
+		const reportLoad = () => {
+			if (this.destroyed || this._loadVersion !== version) return;
+			lastLog = performance.now();
+			logFn?.(`Downloading/decoding models: ${latest.loaded + latest.failed}/${urlArray.length} finished, ${latest.failed} failed; ${((lastLog - started) / 1000).toFixed(1)}s elapsed`);
+		};
+		reportLoad();
+		const heartbeat = setInterval(reportLoad, 2000);
+		let batch;
+		try { batch = await loadGltfBatch({
 			urls: urlArray,
 			concurrency: matchMedia('(pointer: coarse)').matches ? 3 : 8,
 			loadOne: (url) => new Promise((res, rej) => this.gltfLoader.load(url, res, undefined, rej)),
-			onProgress: ({ index, total, loaded, ok, error }) => {
-				if (ok) logFn?.(`Fetched glTF ${loaded}/${total} (parallel x${Math.min(8, total)})`);
-				else logFn?.(`Skipped glTF ${index + 1}/${total} (${error?.message ?? 'load error'})`);
+			onProgress: ({ index, total, loaded, failed, ok, error }) => {
+				latest = { loaded, failed };
+				if (!ok && failed <= 5) logFn?.(`Skipped glTF ${index + 1}/${total} (${error?.message ?? 'load error'})`);
+				if (loaded + failed === total || performance.now() - lastLog >= 750) reportLoad();
 			},
-		});
+		}); } finally { clearInterval(heartbeat); }
+		const { gltfs: gltfArray, stats } = batch;
 		if (this.destroyed || this._loadVersion !== version) {
 			for (const gltf of gltfArray) gltf.scene.traverse(node => {
 				node.geometry?.dispose();
@@ -152,6 +164,7 @@ export class SingleSceneViewer {
 		const diag = sizeVec.length() || 1;
 		const center = box.getCenter(new THREE.Vector3());
 		const ecefUp = center.clone().normalize(); // keep before moving
+		this.metersPerViewerUnit = diag;
 		// move each child by -center (do NOT move the container) so transform order matches the main viewer
 		tilesContainer.children.forEach(child => {
 			if (child.position) child.position.sub(center);
@@ -159,12 +172,17 @@ export class SingleSceneViewer {
 		scene.add(tilesContainer);
 
 		// Rotate ECEF up → +Y
-		const upVector = ecefUp;
-		const targetNorthVector = new THREE.Vector3(0, 1, 0);
-		const rotationAxis = new THREE.Vector3().crossVectors(upVector, targetNorthVector).normalize();
-		const rotationAngle = Math.acos(THREE.MathUtils.clamp(upVector.dot(targetNorthVector), -1, 1));
-		const quaternion = new THREE.Quaternion().setFromAxisAngle(rotationAxis, rotationAngle);
-		tilesContainer.quaternion.multiply(quaternion);
+		// Local east/up/south frame: Minecraft +X east, +Y up, -Z north.
+		const east = new THREE.Vector3(-center.y, center.x, 0);
+		if (east.lengthSq() < 1e-12) east.set(0, 1, 0);
+		east.normalize();
+		const north = new THREE.Vector3().crossVectors(ecefUp, east).normalize();
+		const frame = new THREE.Matrix4().set(
+			east.x, east.y, east.z, 0,
+			ecefUp.x, ecefUp.y, ecefUp.z, 0,
+			-north.x, -north.y, -north.z, 0,
+			0, 0, 0, 1);
+		tilesContainer.quaternion.setFromRotationMatrix(frame);
 
 		// Normalize scale ~[0,1]
 		const newScale = 1 / diag;
@@ -206,6 +224,7 @@ export class SingleSceneViewer {
 	}
 
 	async exportGlb() {
+		if (this.voxelSettingsCurrent === false) throw new Error('Wait for the current scale and rotation preview to finish before exporting.');
 		const mesh = this.voxelMeshes?.[0];
 		let input = this.tilesContainer, temporary;
 		try {
@@ -225,7 +244,7 @@ export class SingleSceneViewer {
 	async setMinecraftEnabled(enabled) {
 		const bias = getMinecraftBrightnessBias();
 		this._mcEnabled = enabled;
-		if (enabled && this._blockResources?.bias !== bias) {
+		if (enabled && (this._blockResources?.bias !== bias || this._blockResources?.paletteKey !== getBlockPaletteKey())) {
 			const request = this._blockRequest = {};
 			const resources = await getPackedBlockResources(bias);
 			if (this.destroyed || this._blockRequest !== request) { resources.lookup.dispose(); return; }

@@ -359,29 +359,13 @@
             </label>
           </div>
 
-          <div>
-            <div class="flex items-center justify-between">
-              <div class="text-sm font-medium opacity-80">Minecraft textures</div>
-              <label class="inline-flex items-center cursor-pointer mobile-button">
-                <div class="relative">
-                  <input id="toggle-mc" type="checkbox" class="sr-only peer" disabled>
-                  <div
-                    class="w-11 h-6 bg-white/10 peer-checked:bg-green-500/80 peer-disabled:opacity-50 rounded-full relative transition">
-                  </div>
-                  <div
-                    class="absolute top-0.5 left-0.5 w-5 h-5 bg-white rounded-full transition-transform duration-300 ease-in-out peer-checked:translate-x-5">
-                  </div>
-                </div>
-              </label>
-            </div>
-            <div class="text-xs opacity-60 mt-1">Enable after voxels are on.</div>
-          </div>
+          <div id="map-minecraft-textures-slot"></div>
 
           <div class="cursor-pointer hover:bg-white/5 -mx-2 px-2 py-1 rounded" id="voxel-methods-btn">
             <div class="flex items-stretch">
               <div class="flex-1">
                 <div class="text-sm font-medium opacity-80">Voxelization Methods</div>
-                <div class="text-xs opacity-60 mt-1">Choose algorithm speed vs accuracy.</div>
+                <div class="text-xs opacity-60 mt-1">Changes the voxelization algorithm and automatically rebuilds loaded geometry. Metres per block stays fixed.</div>
               </div>
               <div class="flex items-center justify-center px-2">
                 <span class="material-symbols-rounded text-2xl opacity-70">edit</span>
@@ -407,7 +391,7 @@
           </div>
 
           <div>
-            <div class="text-sm font-medium opacity-80 mb-2">Voxel resolution</div>
+            <div class="text-sm font-medium opacity-80 mb-2">Main map voxel resolution</div>
             <div class="grid grid-cols-2 md:grid-cols-4 gap-2 md:gap-1 bg-white/5 rounded-xl p-1">
               <button class="res-pill rounded-lg py-2 md:py-1.5 text-sm opacity-80 hover:bg-white/10 mobile-button"
                 data-res="32">Low</button>
@@ -419,7 +403,7 @@
                 data-res="256">Ultra</button>
             </div>
             <input id="res-fine" type="range" min="8" max="512" value="64" class="w-full accent-white/80 mt-2 h-8">
-            <div class="text-xs opacity-60 -mt-1">Drag to fine-tune</div>
+            <div id="global-resolution-hint" class="text-xs opacity-60 -mt-1">Main map voxel density. Updates the map automatically.</div>
           </div>
 
           <div>
@@ -738,32 +722,33 @@
             <!-- Radius (meters) -->
             <div class="mb-1">
               <label for="single-scene-radius" class="block text-sm font-medium text-white/80 mb-1">Radius</label>
-              <input id="single-scene-radius" type="range" min="20" max="3000" step="50" value="500"
+              <input id="single-scene-radius" type="range" min="20" max="20000" step="20" value="500"
                 class="w-full slider slider-lg">
               <div class="flex justify-between items-center text-xs opacity-60 mt-1 gap-2">
                 <span>20 m</span>
                 <label class="flex items-center gap-1 text-white/90">
-                  <input id="single-scene-radius-value" type="number" min="0" max="3000" value="500"
+                  <input id="single-scene-radius-value" type="number" min="20" max="20000" value="500"
                     class="w-20 bg-white/5 text-white text-xs text-center rounded border border-white/20 px-1 py-0.5 focus:outline-none focus:ring-1 focus:ring-amber-400"
                     inputmode="numeric" />
                   <span>m</span>
                 </label>
-                <span>3 km</span>
+                <span>20 km</span>
               </div>
             </div>
 
             <!-- SSE -->
             <div id="single-scene-sse-row" class="mb-1">
-              <label for="single-scene-sse" class="block text-sm font-medium text-white/80 mb-1">Screen Space Error
-                (SSE)</label>
-              <input id="single-scene-sse" type="range" min="2" max="64" value="20" class="w-full slider slider-lg">
+              <label for="single-scene-sse" class="block text-sm font-medium text-white/80 mb-1">Source detail threshold (metres)</label>
+              <input id="single-scene-sse" type="range" min="0.1" max="64" step="0.1" value="1" class="w-full slider slider-lg">
               <div class="flex justify-between items-center text-xs opacity-60 mt-1 gap-2">
                 <span>High detail</span>
-                <input id="single-scene-sse-value" type="number" min="2" max="64" value="20"
+                <input id="single-scene-sse-value" type="number" min="0.1" max="64" step="0.1" value="1"
                   class="w-16 bg-white/5 text-white text-xs text-center rounded border border-white/20 px-1 py-0.5 focus:outline-none focus:ring-1 focus:ring-amber-400"
                   inputmode="numeric" />
                 <span>Low detail</span>
               </div>
+              <label class="flex items-center gap-2 text-xs mt-2"><input id="single-scene-max-detail" type="checkbox">Highest available source detail</label>
+              <p class="text-xs opacity-60 mt-1">Lower values fetch finer geometry and more tiles. Start at 1 m for 1 m blocks. Refetch to apply. This is geometric error, not camera pixel SSE.</p>
             </div>
 
             <!-- Rotation (Y) -->
@@ -803,6 +788,18 @@
 
             <!-- Resolution / Density -->
             <div class="mt-2">
+              <label for="single-scene-scale-mode" class="block text-sm font-medium text-white/80 mb-2">Minecraft scale</label>
+              <select id="single-scene-scale-mode" class="w-full bg-white/10 rounded-lg px-2 py-1 text-xs mb-2">
+                <option value="metric" selected>Exact metres per block</option>
+                <option value="density">Per-tile density (legacy)</option>
+              </select>
+              <label for="single-scene-meters-per-block" class="block text-xs text-white/80">Metres per block</label>
+              <input id="single-scene-meters-per-block" type="number" min="0.1" max="100" step="0.1" value="1"
+                class="w-full rounded-lg bg-white/10 px-2 py-1 text-xs outline-none mt-1" />
+              <p class="text-xs opacity-60 mt-1 mb-2">1 = life size. Rotation is applied before making blocks. At 0°, east is +X and north is −Z.</p>
+              <p id="single-scene-scale-summary" class="text-xs text-emerald-200 mb-2" aria-live="polite">1 block = 1 metre</p>
+              <button id="single-scene-rebuild" class="w-full bg-white/10 rounded-lg px-2 py-2 text-xs mb-2">Rebuild voxel preview</button>
+              <div id="single-scene-density-controls" class="hidden">
               <label class="block text-sm font-medium text-white/80 mb-2">Voxel Density</label>
               <div class="grid grid-cols-2 gap-1 bg-white/5 rounded-lg p-1 mb-2">
                 <button class="single-scene-res-pill rounded py-1.5 text-xs opacity-80 hover:bg-white/10"
@@ -824,10 +821,53 @@
               </div>
               <div class="text-xs opacity-60 mt-1">Fine-tune per-tile density. Larger capture areas automatically add
                 more voxels.</div>
+              </div>
             </div>
           </div>
         </div>
 
+
+        <p class="text-xs opacity-70 mt-2">Instant: Minecraft textures and palette. Rebuilds automatically: algorithm, rotation, metres per block. Fetch Tiles again: location, radius, source detail. Density presets do not apply in metre-based mode.</p>
+        <fieldset id="minecraft-block-palette" class="mt-3 bg-white/5 rounded-lg p-3 text-xs space-y-2">
+          <legend class="text-sm font-medium">Minecraft block palette</legend>
+          <p class="opacity-70">Vanilla Minecraft 26.3 assets · default-state full cubes · gravity blocks excluded</p>
+          <div id="palette-minecraft-textures-slot">
+            <div id="minecraft-textures-control">
+              <label class="flex items-center gap-2 cursor-pointer"><input id="toggle-mc" type="checkbox" disabled>Minecraft textures</label>
+              <p class="text-xs opacity-60 mt-1">Updates the preview immediately. Schematic exports always use the chosen block palette.</p>
+            </div>
+          </div>
+          <label for="single-scene-colour-matching" class="block">Colour matching</label>
+          <select id="single-scene-colour-matching" class="w-full bg-white/10 rounded-lg px-2 py-2">
+            <option value="accurate" selected>Accurate — nearest OKLab colour</option>
+            <option value="fast">Fast — approximate colour bins</option>
+          </select>
+          <p class="opacity-60">Accurate compares the voxel colour with every enabled block's average texture colour. Fast improves preview speed but can pick a less similar block. Changing this updates matching without refetching.</p>
+          <label for="single-scene-colour-profile" class="block">Block colour reference</label>
+          <select id="single-scene-colour-profile" class="w-full bg-white/10 rounded-lg px-2 py-2">
+            <option value="balanced">Balanced — all six faces</option>
+            <option value="top">Terrain — top face colours</option>
+            <option value="sides">Buildings — side face colours</option>
+          </select>
+          <p class="opacity-60">Profiles use linear-light texture averages from the actual block models. The preview shows each face's texture. Changing the reference updates matching without rebuilding.</p>
+          <label class="flex items-center gap-2"><input data-block-palette="wool" type="checkbox" checked>All 16 wool colours</label>
+          <label class="flex items-center gap-2"><input data-block-palette="concrete" type="checkbox" checked>All 16 concrete colours</label>
+          <label class="flex items-center gap-2"><input data-block-palette="terracotta" type="checkbox" checked>All 16 terracotta colours + plain terracotta</label>
+          <label class="flex items-center gap-2"><input data-block-palette="glazed" type="checkbox">All 16 glazed terracotta colours</label>
+          <label class="flex items-center gap-2"><input data-block-palette="other" type="checkbox">Other blocks from the existing palette</label>
+          <p class="opacity-60">Falling blocks are always excluded. Changes update colour matching without fetching or voxelizing again.</p>
+          <p id="single-scene-palette-status" aria-live="polite">49 coloured blocks selected</p>
+          <div class="flex flex-wrap gap-2">
+            <button id="palette-all-solids" type="button" class="rounded bg-white/10 px-2 py-2">Use all opaque solid blocks</button>
+            <button id="palette-export-all" type="button" class="rounded bg-white/10 px-2 py-2">Export full block list</button>
+            <button id="palette-export-selected" type="button" class="rounded bg-white/10 px-2 py-2">Export selected blocks</button>
+            <button id="palette-import" type="button" class="rounded bg-white/10 px-2 py-2">Import block list</button>
+            <button id="palette-reset" type="button" class="hidden rounded bg-white/10 px-2 py-2">Use block families</button>
+          </div>
+          <input id="palette-import-file" type="file" accept=".json,.txt,application/json,text/plain" class="hidden">
+          <p class="opacity-60">Full list: Minecraft 26.3 block IDs, enabled flags and model/texture support notes. All-solids uses opaque full cubes; transparent cubes are available through custom lists. Import JSON or one ID per line. Unsupported and falling blocks are skipped.</p>
+          <p id="palette-file-status" aria-live="polite"></p>
+        </fieldset>
 
         <!-- Single Scene export compliance -->
         <div id="single-scene-compliance"
@@ -855,9 +895,10 @@
           <div class="flex items-center gap-2">
             <select id="single-scene-export-format"
               class="flex-1 min-w-0 bg-white/10 rounded-lg px-2 py-1 text-xs outline-none">
+              <option value="schem" selected>Combined WorldEdit / FAWE (.schem)</option>
+              <option value="schem-zip">Tiled WorldEdit schematics (.zip)</option>
               <option value="nbt">Structure (.nbt)</option>
-              <option value="schem">WorldEdit v2 (.schem)</option>
-              <option value="schematic">MCEdit legacy (.schematic)</option>
+              <option value="schematic">MCEdit legacy (old blocks only)</option>
               <option value="mcfunction">mcfunction (vanilla)</option>
             </select>
             <button id="single-scene-export-btn"
@@ -867,8 +908,9 @@
             </button>
           </div>
           <div class="text-[11px] opacity-60 mt-1">
-            <b>.nbt</b> = structure block format (Java). <b>.schem</b> = WorldEdit v2. <b>.schematic</b> = legacy
+            <b>.schem</b> = one combined file for WorldEdit / FAWE. <b>.nbt</b> = structure block format (Java). <b>.schematic</b> = legacy
             MCEdit. <b>.mcfunction</b> places blocks at ~x ~y ~z.
+            <b>.zip</b> splits large areas into schematics with placement offsets and instructions.
           </div>
         </div>
 

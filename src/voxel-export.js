@@ -1,5 +1,5 @@
 import * as THREE from 'three';
-import { BLOCKS, initBlockData, getMinecraftBrightnessBias, getSharedAtlasTexture } from './assignToBlocksForGLB.js';
+import { BLOCKS, initBlockData, getMinecraftBrightnessBias, getSharedAtlasTexture, getBlockMatchingMode, getBlockPaletteKey } from './assignToBlocksForGLB.js';
 
 export class VoxelExportSession {
   async run(grid, format, onProgress) {
@@ -9,12 +9,13 @@ export class VoxelExportSession {
     if (generation !== (this.generation ?? 0)) throw new Error('Export cancelled');
     if (this.pending) throw new Error('An export is already running');
     if (!this.worker) this.worker = new Worker(new URL('./voxel-export.worker.js', import.meta.url), { type: 'module' });
-    const paletteKey = JSON.stringify([getMinecraftBrightnessBias(), BLOCKS.map(b => b.name)]);
+    const paletteKey = JSON.stringify([getMinecraftBrightnessBias(), getBlockPaletteKey(), BLOCKS.map(b => b.name)]);
     const payload = { format, maxCells: matchMedia('(pointer: coarse)').matches ? 16_000_000 : 50_000_000 };
     if (this.grid !== grid) payload.grid = grid;
     if (this.paletteKey !== paletteKey) {
-      payload.palette = BLOCKS.map(({ name, oklab, uv }) => ({ name, oklab, uv }));
+      payload.palette = BLOCKS.map(({ name, oklab, uv, faceUvs }) => ({ name, oklab, uv, faceUvs }));
       payload.bias = getMinecraftBrightnessBias();
+      payload.matchingMode = getBlockMatchingMode();
     }
     return new Promise((resolve, reject) => {
       this.pending = reject;
@@ -45,13 +46,16 @@ export async function makeExportGroup(surface) {
   if (surface.palette) {
     const atlas = await getSharedAtlasTexture();
     const byName = new Map(BLOCKS.map(block => [block.name, block]));
-    for (const name of surface.palette) {
-      const rect = byName.get(name).uv;
+    for (let index = 0; index < surface.palette.length; index++) {
+      const block = byName.get(surface.palette[index]);
+      const rect = block.faceUvs?.[surface.materialFaces?.[index]] ?? block.uv;
       const canvas = document.createElement('canvas'); canvas.width = canvas.height = 16;
       // The shared preview atlas has flipY=false: its UV rows follow image rows.
-      canvas.getContext('2d').drawImage(atlas.image, rect.offsetX * atlas.image.width,
-        rect.offsetY * atlas.image.height, rect.repeatX * atlas.image.width,
-        rect.repeatY * atlas.image.height, 0, 0, 16, 16);
+      const context = canvas.getContext('2d');
+      context.imageSmoothingEnabled = false;
+      context.drawImage(atlas.image, Math.round(rect.offsetX * atlas.image.width),
+        Math.round(rect.offsetY * atlas.image.height), Math.round(rect.repeatX * atlas.image.width),
+        Math.round(rect.repeatY * atlas.image.height), 0, 0, 16, 16);
       const texture = new THREE.CanvasTexture(canvas); texture.colorSpace = THREE.SRGBColorSpace;
       texture.flipY = false;
       texture.wrapS = texture.wrapT = THREE.RepeatWrapping;
@@ -78,7 +82,7 @@ export async function makeExportGroup(surface) {
 }
 
 export function downloadExport(data, filename) {
-  const url = URL.createObjectURL(new Blob([data], { type: 'application/octet-stream' }));
+  const url = URL.createObjectURL(new Blob(data.fileParts ?? data.archiveParts ?? [data], { type: data.archiveParts ? 'application/zip' : 'application/octet-stream' }));
   const link = document.createElement('a'); link.href = url; link.download = filename;
   document.body.appendChild(link); link.click(); link.remove();
   setTimeout(() => URL.revokeObjectURL(url), 60000);
