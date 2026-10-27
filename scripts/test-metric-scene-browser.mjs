@@ -191,6 +191,38 @@ try {
   assert.equal(report.zip.manifest.metersPerBlock, 2);
   assert.equal(report.zip.manifest.rotationDegrees, 90);
   assert.ok(report.zip.bytes > 1000);
+  await page.locator('#single-scene-shape-detail').check();
+  await ready();
+  const detail = await measure();
+  assert.equal(detail.metadata.shapeSampling, 2);
+  assert.equal(detail.metadata.metersPerBlock, 2);
+  assert.ok(Math.abs(detail.metersPerBlock - 1) < 1e-10, 'Shape mode must sample at half the final block spacing');
+  const shapeExport = await page.evaluate(async () => {
+    const viewer = window.singleSceneViewer;
+    const grid = { gridSize: {x:2,y:2,z:2}, unit:{x:.5,y:.5,z:.5},bbox:{min:[0,0,0],max:[1,1,1]},
+      sparse:{indices:Float64Array.from([0,1,2,3,6,7]),colors:new Uint32Array(6).fill(0xff808080)},
+      exportMetadata:{metersPerBlock:1,shapeSampling:2,rotationDegrees:15} };
+    const messages=[];
+    const schematic = await viewer.exportSession.run(grid,'schem',message=>messages.push(message));
+    const nbt = await viewer.exportSession.run(grid,'nbt');
+    const zip = await viewer.exportSession.run(grid,'schem-zip');
+    const surface = await viewer.exportSession.run(grid,'surface-blocks');
+    return { schematic:[...new Uint8Array(await new Blob(schematic.fileParts).arrayBuffer())],nbt:[...nbt],
+      manifest:zip.manifest,previewMaterials:surface.palette,messages };
+  });
+  const shaped = nbt.simplify((await nbt.parse(Buffer.from(shapeExport.schematic))).parsed);
+  assert.deepEqual([shaped.Width,shaped.Height,shaped.Length],[1,1,1]);
+  assert.ok(Object.keys(shaped.Palette).some(state=>state.includes('_stairs[') && state.includes('half=top')));
+  const shapedNbt = nbt.simplify((await nbt.parse(Buffer.from(shapeExport.nbt))).parsed);
+  assert.ok(shapedNbt.palette.some(entry=>entry.Properties?.half === 'top'));
+  assert.equal(shapeExport.manifest.gridSize.x,1);
+  assert.equal(shapeExport.manifest.metersPerBlock,1);
+  assert.ok(shapeExport.previewMaterials.every(name=>!name.includes('[')), 'GLB exports the source sample preview, not fitted blocks');
+  assert.ok(shapeExport.messages.some(message=>message.includes('Shape fit:')));
+  report.shapeDetail = {sampleSpacing:detail.metersPerBlock,finalBlockSpacing:detail.metadata.metersPerBlock,
+    palette:Object.keys(shaped.Palette),stats:JSON.parse(shaped.Metadata.VoxelEarth).shapeFit};
+  await page.locator('#single-scene-shape-detail').uncheck();
+  await ready();
   await page.screenshot({ path: 'output/playwright/metric-scene-desktop.png' });
   await page.setViewportSize({ width: 390, height: 844 });
   await page.screenshot({ path: 'output/playwright/metric-scene-mobile.png' });

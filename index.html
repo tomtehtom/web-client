@@ -797,6 +797,8 @@
               <input id="single-scene-meters-per-block" type="number" min="0.1" max="100" step="0.1" value="1"
                 class="w-full rounded-lg bg-white/10 px-2 py-1 text-xs outline-none mt-1" />
               <p class="text-xs opacity-60 mt-1 mb-2">1 = life size. Rotation is applied before making blocks. At 0°, east is +X and north is −Z.</p>
+              <label class="flex items-center gap-2 text-xs mt-2"><input id="single-scene-shape-detail" type="checkbox">Slab/stair detail (2 × 2 × 2 samples per block)</label>
+              <p class="text-xs opacity-60 mt-1 mb-2">Half-block sample preview; Minecraft exports fit full blocks, top/bottom slabs and oriented stairs. Uses all vanilla slab/stair materials plus your full-block palette. Eight times the volume samples. Requires exact metric scale; rebuild to apply.</p>
               <p id="single-scene-scale-summary" class="text-xs text-emerald-200 mb-2" aria-live="polite">1 block = 1 metre</p>
               <button id="single-scene-rebuild" class="w-full bg-white/10 rounded-lg px-2 py-2 text-xs mb-2">Rebuild voxel preview</button>
               <div id="single-scene-density-controls" class="hidden">

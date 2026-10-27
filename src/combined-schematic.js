@@ -30,8 +30,8 @@ export function buildSparseSchematic(grid) {
   const palette = ['minecraft:air'], remap = new Map([[palette[0], 0]]);
   const match = createExportBlockMatcher(grid);
   let used = 0, byteLength = volume;
-  iterateVoxelSamples(grid, ({ x, y, z, r, g, b }) => {
-    const name = match(r, g, b);
+  iterateVoxelSamples(grid, ({ x, y, z, r, g, b, state }) => {
+    const name = state ?? match(r, g, b);
     if (!name) return;
     const fullName = name.includes(':') ? name : `minecraft:${name}`;
     let id = remap.get(fullName);

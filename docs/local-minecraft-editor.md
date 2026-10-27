@@ -1,5 +1,44 @@
 # Local Minecraft editor
 
+## Half-block slab/stair detail
+
+In Single Scene, enable **Slab/stair detail (2 × 2 × 2 samples per block)** under
+Minecraft scale. Leave **Metres per block = 1** for life size. This samples the
+source at 0.5 m while exporting one Minecraft block per metre. Rotation is applied
+before sampling. Changing the checkbox rebuilds existing loaded geometry; source
+detail still needs a refetch if you change the tile detail threshold. Consider
+0.5 m source detail for this mode. Eight samples per cubic metre can require much
+more memory and processing than the normal full-block mode.
+
+The preview and GLB show the fine voxel samples, not the fitted block shapes.
+Modern Minecraft exports (`.schem`, tiled `.schem` ZIP, `.nbt`, and `.mcfunction`)
+group samples back into 2 × 2 × 2 cells and fit full cubes, top/bottom slabs, or
+stairs with facing/half/inner/outer states. Legacy MCEdit export is rejected in
+this mode because it cannot preserve modern states.
+
+The generated `public/minecraft-shapes.json` contains **198 materials and 4,082
+states**, baked from vanilla 26.3 block models. Slab/stair matching considers all
+these materials; full cubes use your current palette. This allows coloured voxel
+surfaces to use the closest available stair/slab material even when the full-block
+palette contains only wool/concrete/terracotta, which have no equivalent shapes.
+Colour profiles and brightness bias apply to matching. Waterlogging is disabled.
+
+An occupied sample is one bit in an eight-bit mask. Full cubes contain eight,
+slabs four, straight stairs six, inner stairs seven, and outer stairs five.
+Exact masks win before colour is considered. For other masks, the fitter minimises
+added plus missing occupied samples, then prefers less added volume on ties, then
+compares average source colour in OKLab. It does not discard entire occupied cells
+or insert arbitrary single-block air to improve a score. Shape-fit counts and
+added/missing samples are saved in export metadata; progress logs show exact vs
+approximate counts. Thin/sparse surfaces therefore remain approximations where
+Minecraft has no matching geometry.
+
+The automated tests check all 255 nonempty masks, an independent direction/half
+oracle, colour choices, metric grouping, and parsed NBT/schematic properties.
+Browser tests verify the UI, worker and export paths. In-game pasting and neighbour
+updates have not been verified: Minecraft can recalculate stair corner states when
+surrounding blocks change, so test a small export in your world first.
+
 ## Minecraft 26.3 palette
 
 The registry, textures, block colour references and export DataVersion now target

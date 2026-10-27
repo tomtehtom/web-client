@@ -1,11 +1,21 @@
 import * as THREE from 'three';
-import { BLOCKS, initBlockData, getMinecraftBrightnessBias, getSharedAtlasTexture, getBlockMatchingMode, getBlockPaletteKey } from './assignToBlocksForGLB.js';
+import { BLOCKS, initBlockData, getMinecraftBrightnessBias, getSharedAtlasTexture, getBlockMatchingMode, getBlockPaletteKey, getBlockColourProfile } from './assignToBlocksForGLB.js';
+
+let shapeMaterials;
+async function loadShapeMaterials() {
+  if (!shapeMaterials) shapeMaterials = fetch('/minecraft-shapes.json').then(async response => {
+    if (!response.ok) throw new Error('Cannot load Minecraft slab/stair materials.');
+    return (await response.json()).materials;
+  }).catch(error => { shapeMaterials = null; throw error; });
+  return shapeMaterials;
+}
 
 export class VoxelExportSession {
   async run(grid, format, onProgress) {
     const generation = this.generation ?? 0;
     if (this.pending) throw new Error('An export is already running');
     await initBlockData();
+    const shapes = grid.exportMetadata?.shapeSampling === 2 ? await loadShapeMaterials() : null;
     if (generation !== (this.generation ?? 0)) throw new Error('Export cancelled');
     if (this.pending) throw new Error('An export is already running');
     if (!this.worker) this.worker = new Worker(new URL('./voxel-export.worker.js', import.meta.url), { type: 'module' });
@@ -17,6 +27,7 @@ export class VoxelExportSession {
       payload.bias = getMinecraftBrightnessBias();
       payload.matchingMode = getBlockMatchingMode();
     }
+    if (shapes) { payload.shapes = shapes; payload.profile = getBlockColourProfile(); payload.bias = getMinecraftBrightnessBias(); }
     return new Promise((resolve, reject) => {
       this.pending = reject;
       this.worker.onmessage = ({ data }) => {

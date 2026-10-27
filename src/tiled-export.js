@@ -54,10 +54,13 @@ export function partitionSparseGrid(grid, edge = 128) {
   for (const bucket of buckets.values()) {
     bucket.indices = new indices.constructor(bucket.count);
     bucket.colors = new Uint32Array(bucket.count);
+    if (grid.fittedStates) bucket.stateIds = new Uint32Array(bucket.count);
   }
   for (let at = 0; at < indices.length; at++) {
     const bucket = buckets.get(keyFor(indices[at]));
-    bucket.indices[bucket.at] = indices[at]; bucket.colors[bucket.at++] = colors[at];
+    bucket.indices[bucket.at] = indices[at];
+    if (bucket.stateIds) bucket.stateIds[bucket.at] = grid.fittedStates.ids[at];
+    bucket.colors[bucket.at++] = colors[at];
   }
   return buckets;
 }
@@ -78,7 +81,8 @@ export async function exportTiledSchematics(grid, onProgress = () => {}) {
   let archiveBytes = 0, number = 0;
   for (const [key, bucket] of buckets) {
     onProgress(`Writing schematic ${++number}/${totalTiles}…`);
-    const blocks = buildBlockGrid({ ...grid, sparse: { indices: bucket.indices, colors: bucket.colors } }, { maxCells: 128 ** 3 });
+    const blocks = buildBlockGrid({ ...grid, sparse: { indices: bucket.indices, colors: bucket.colors },
+      fittedStates: bucket.stateIds ? { palette: grid.fittedStates.palette, ids: bucket.stateIds } : undefined }, { maxCells: 128 ** 3 });
     const name = `tiles/tile_${key.replaceAll(',', '_')}.schem`;
     const bytes = await writeSpongeSchem(blocks);
     archiveBytes += bytes.length;

@@ -10,6 +10,7 @@ import io
 import json
 import math
 import os
+import itertools
 from functools import lru_cache
 from pathlib import Path
 from zipfile import ZipFile
@@ -224,6 +225,32 @@ def main():
     unique = {}
     details = {}
     blocks = []
+    shapes = []
+
+    def shape_mask(name, state):
+        definition = json.loads(jar.read(f'assets/minecraft/blockstates/{name}.json'))
+        selected = []
+        for key, value in definition.get('variants', {}).items():
+            when = dict(item.split('=', 1) for item in key.split(',')) if key else {}
+            if matches(when, state):
+                selected.append(value[0] if isinstance(value, list) else value)
+                break
+        for part in definition.get('multipart', []):
+            if matches(part.get('when'), state):
+                value = part['apply']
+                selected.append(value[0] if isinstance(value, list) else value)
+        mask = 0
+        for selection in selected:
+            matrix = rotation_matrix(selection.get('x', 0), selection.get('y', 0))
+            for element in model(selection['model']).get('elements', []):
+                if element.get('rotation', {}).get('angle', 0):
+                    raise ValueError('Non-axis-aligned shape')
+                lo, hi = np.array(element['from']), np.array(element['to'])
+                for x, y, z in itertools.product(range(2), repeat=3):
+                    point = matrix.T @ (np.array([4 + 8*x, 4 + 8*y, 4 + 8*z]) - 8) + 8
+                    if np.all(point >= lo) and np.all(point < hi):
+                        mask |= 1 << (x + 2*y + 4*z)
+        return mask
 
     def add_image(image):
         key = 'voxelearth:face/' + hashlib.sha256(image.tobytes()).hexdigest()[:20]
@@ -242,6 +269,23 @@ def main():
     for name in block_names:
         try:
             faces, full_cube = bake(name)
+            if name.endswith(('_slab', '_stairs')) and not gravity(name):
+                options, default_state = defaults[name]
+                variants = []
+                keys = ['type'] if name.endswith('_slab') else ['facing', 'half', 'shape']
+                for values in itertools.product(*(options[key] for key in keys)):
+                    state = {**default_state, **dict(zip(keys, values))}
+                    if state.get('type') == 'double':
+                        continue
+                    state['waterlogged'] = 'false'
+                    mask = shape_mask(name, state)
+                    if mask and mask != 255:
+                        properties = ','.join(f'{key}={value}' for key, value in sorted(state.items()))
+                        variants.append({'state': name + '[' + properties + ']', 'mask': mask})
+                if variants:
+                    shapes.append({'name': name, 'variants': variants,
+                                   'colours': {'balanced': average(list(faces.values())), 'top': average([faces['up']]),
+                                               'sides': average([faces[face] for face in ['west', 'east', 'north', 'south']])}})
             opaque = all(np.asarray(image)[:, :, 3].min() == 255 for image in faces.values())
             visible = all(np.asarray(image)[:, :, 3].max() > 0 for image in faces.values())
             reason = 'Falling or support-dependent block excluded' if gravity(name) else 'Default model is not a full cube' if not full_cube else 'No visible texture on every face' if not visible else None
@@ -274,6 +318,7 @@ def main():
     (ROOT / 'public/vanilla.atlas').write_text(json.dumps(payload, indent=2) + '\n')
     atlas.save(ROOT / 'public/vanilla.png')
     (ROOT / 'public/minecraft-block-registry.json').write_text(json.dumps(registry, indent=2) + '\n')
+    (ROOT / 'public/minecraft-shapes.json').write_text(json.dumps({'minecraftVersion': version['id'], 'materials': shapes}, indent=2) + '\n')
     (ROOT / 'src/minecraft-version.js').write_text(f"// Generated from the installed vanilla client version.json.\nexport const MINECRAFT_VERSION = '{version['id']}';\nexport const MINECRAFT_DATA_VERSION = {version['world_version']};\nexport const BLOCK_REGISTRY_COUNT = {len(block_names)};\n")
     opaque = [name for name, info in details.items() if info['supported'] and info['opaque']]
     report = {'minecraftVersion': version['id'], 'registryBlocks': len(block_names), 'supportedCubes': len(blocks),

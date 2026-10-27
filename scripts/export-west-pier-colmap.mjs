@@ -1,0 +1,10 @@
+import * as T from 'three';
+import {PLYLoader} from 'three/addons/loaders/PLYLoader.js';
+import {GLTFExporter} from 'three/addons/exporters/GLTFExporter.js';
+import {readFile,writeFile} from 'node:fs/promises';
+globalThis.FileReader=class {readAsArrayBuffer(blob){blob.arrayBuffer().then(v=>{this.result=v;this.onloadend?.();});}readAsDataURL(blob){blob.arrayBuffer().then(v=>{this.result=`data:${blob.type};base64,${Buffer.from(v).toString('base64')}`;this.onloadend?.();});}};
+const base=new URL('../../assets/west-pier/photogrammetry/run-retry-1600/dense-2/',import.meta.url);
+const raw=await readFile(new URL('mesh.ply',base));const geometry=new PLYLoader().parse(raw.buffer.slice(raw.byteOffset,raw.byteOffset+raw.byteLength));geometry.computeVertexNormals();geometry.computeBoundingBox();
+const mesh=new T.Mesh(geometry,new T.MeshStandardMaterial({vertexColors:!!geometry.getAttribute('color'),color:0xffffff,roughness:1,side:T.DoubleSide}));mesh.name='COLMAP unscaled incomplete reconstruction';mesh.userData={scale:'arbitrary; not metres',historicalTarget:'mixed pre-fire reference dates',status:'experimental partial mesh; not a finished Minecraft asset'};
+const scene=new T.Scene();scene.add(mesh);const result=await new GLTFExporter().parseAsync(scene,{binary:true});await writeFile(new URL('west-pier-colmap-partial-unscaled.glb',base),Buffer.from(result));
+console.log(JSON.stringify({vertices:geometry.getAttribute('position').count,triangles:geometry.index?geometry.index.count/3:geometry.getAttribute('position').count/3,coloured:!!geometry.getAttribute('color'),bounds:geometry.boundingBox,bytes:result.byteLength}));

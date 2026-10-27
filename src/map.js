@@ -426,6 +426,7 @@ class HUD {
     const rotValue = document.querySelector('#single-scene-rot-value');
     const scaleMode = document.querySelector('#single-scene-scale-mode');
     const metersInput = document.querySelector('#single-scene-meters-per-block');
+    const shapeDetail = document.querySelector('#single-scene-shape-detail');
     const scaleSummary = document.querySelector('#single-scene-scale-summary');
     const markSettingsChanged = () => {
       const viewer = window.singleSceneViewer;
@@ -438,6 +439,7 @@ class HUD {
     const updateScaleUI = () => {
       const metric = scaleMode.value === 'metric';
       metersInput.disabled = !metric;
+      shapeDetail.disabled = !metric;
       document.querySelector('#single-scene-density-controls').classList.toggle('hidden', metric);
       [resFine, resInput, ...resPills].forEach(el => { if (el) el.disabled = metric; });
       scaleSummary.textContent = metric ? `1 block = ${metersInput.value} metre(s)` : 'Scale depends on tile density';
@@ -452,6 +454,7 @@ class HUD {
     };
     scaleMode.addEventListener('change', rebuildScale);
     metersInput.addEventListener('change', rebuildScale);
+    shapeDetail.addEventListener('change', rebuildScale);
     document.querySelector('#single-scene-rebuild').addEventListener('click', () => this._rebuildSingleSceneVoxels(this.getSingleSceneRes()));
     updateScaleUI();
     const paletteChecks = [...document.querySelectorAll('[data-block-palette]')];
@@ -1093,12 +1096,14 @@ class HUD {
     const tilesAcross = Math.max(1, maxDim / tileDiag);
     const computedResolution = Math.max(8, Math.round(densitySetting * tilesAcross));
     const viewerMeters = viewer.metersPerViewerUnit;
-    const exactVoxelSize = metric ? metersPerBlock / viewerMeters : null;
+    const shapeSampling = metric && document.querySelector('#single-scene-shape-detail')?.checked ? 2 : 1;
+    const exactVoxelSize = metric ? metersPerBlock / viewerMeters / shapeSampling : null;
     if (metric && (!Number.isFinite(exactVoxelSize) || exactVoxelSize <= 0)) {
       this._logSingleScene('Metric scale is unavailable. Fetch the tiles again.'); return;
     }
     log(metric ? `Voxelizing at exactly ${metersPerBlock} metre(s) per block, rotation ${rotDeg}°…`
       : `Voxelizing at density ${densitySetting}, rotation ${rotDeg}°…`);
+    if (shapeSampling === 2) log(`Slab/stair detail: ${metersPerBlock / 2} m samples, 2 × 2 × 2 per exported block. Preview shows samples; Minecraft export fits shapes.`);
 
     let vox;
     let lastStage = 'Preparing source geometry';
@@ -1155,6 +1160,7 @@ class HUD {
       ...viewer.captureMetadata,
       metersPerBlock: metric ? metersPerBlock : rawGrid.unit.x * viewerMeters,
       scaleMode: metric ? 'metric' : 'density', rotationDegrees: rotDeg,
+      shapeSampling,
       rotationConvention: 'Positive Y rotation: east turns toward north; north turns toward west.',
     };
 
@@ -1189,7 +1195,7 @@ class HUD {
     this._setSingleSceneVisibility(!!state.vox);
 
     const dims = rawGrid?.gridSize;
-    const summary = dims ? `${dims.x} × ${dims.y} × ${dims.z} blocks; ${rawGrid.exportMetadata.metersPerBlock.toFixed(3)} m/block; ${rotDeg}°` : 'Preview ready';
+    const summary = dims ? `${dims.x} × ${dims.y} × ${dims.z} ${shapeSampling === 2 ? 'half-block samples' : 'blocks'}; ${rawGrid.exportMetadata.metersPerBlock.toFixed(3)} m/block; ${rotDeg}°${shapeSampling === 2 ? '; slab/stair export' : ''}` : 'Preview ready';
     document.querySelector('#single-scene-scale-summary').textContent = summary;
     log(`✅ ${vox.voxelCount ?? '—'} occupied blocks. ${summary}`);
     if (vox.stats) log(`Stage timings: geometry ${(vox.stats.bakeMs / 1000).toFixed(1)}s; raster ${(vox.stats.rasterMs / 1000).toFixed(1)}s; colours/mesh ${(vox.stats.meshMs / 1000).toFixed(1)}s; export grid ${(vox.stats.gridExportMs / 1000).toFixed(1)}s`);

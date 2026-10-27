@@ -1,13 +1,22 @@
 import { ByteWriter, writeUncompressed } from './nbt.js';
 import { MINECRAFT_DATA_VERSION } from './minecraft-version.js';
 
+export function structurePaletteEntry(state) {
+  const [name, properties] = state.replace(/\]$/, '').split('[');
+  const entry = { Name: { type: 'string', value: name.includes(':') ? name : `minecraft:${name}` } };
+  if (properties) entry.Properties = { type: 'compound', value: Object.fromEntries(properties.split(',').map(pair => {
+    const [key, value] = pair.split('='); return [key, { type: 'string', value }];
+  })) };
+  return entry;
+}
+
 // Write each occupied block straight to bytes, avoiding two object graphs with
 // several objects and arrays per voxel before NBT encoding even starts.
 export async function writeStructureGrid({ size, palette, data }, dataVersion = MINECRAFT_DATA_VERSION) {
   const head = writeUncompressed({ type: 'compound', name: '', value: {
     DataVersion: { type: 'int', value: dataVersion },
     size: { type: 'list', value: { type: 'int', value: [size.x, size.y, size.z] } },
-    palette: { type: 'list', value: { type: 'compound', value: palette.map(name => ({ Name: { type: 'string', value: `minecraft:${name}` } })) } },
+    palette: { type: 'list', value: { type: 'compound', value: palette.map(structurePaletteEntry) } },
   } });
   let count = 0;
   for (const value of data) if (value >= 0) count++;

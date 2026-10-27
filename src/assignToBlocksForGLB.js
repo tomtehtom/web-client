@@ -232,7 +232,7 @@ function linearToSrgb(c) {
 }
 
 // sRGB (0..1) → OKLab
-function rgbToOKLab(r, g, b) {
+export function rgbToOKLab(r, g, b) {
   // linearize first
   const rl = toLinear(r), gl = toLinear(g), bl = toLinear(b);
   const l = 0.4122214708*rl + 0.5363325363*gl + 0.0514459929*bl;
@@ -421,6 +421,7 @@ export function iterateVoxelSamples(voxelGrid, fn) {
     for (let at = 0; at < indices.length; at++) {
       const i = indices[at], color = colors[at];
       fn({ x: i % NX, y: Math.floor(i / NX) % NY, z: Math.floor(i / (NX * NY)), linearIndex: i, count: 1,
+        state: voxelGrid.fittedStates?.palette[voxelGrid.fittedStates.ids[at]],
         r: toMatcherSpace((color & 255) / 255), g: toMatcherSpace(((color >>> 8) & 255) / 255),
         b: toMatcherSpace(((color >>> 16) & 255) / 255), alpha: (color >>> 24) / 255 });
     }
@@ -1370,8 +1371,8 @@ export function buildBlockGrid(voxelGrid, { maxCells = 50_000_000 } = {}) {
   const matchBlock = createExportBlockMatcher(voxelGrid);
 
   if (hasData) {
-    iterateVoxelSamples(voxelGrid, ({ x, y, z, r, g, b }) => {
-      const name = matchBlock(r, g, b);
+    iterateVoxelSamples(voxelGrid, ({ x, y, z, r, g, b, state }) => {
+      const name = state ?? matchBlock(r, g, b);
       if (!name) return;
       const lx = x - min.x;
       const ly = y - min.y;

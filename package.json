@@ -22,6 +22,7 @@
     "test:colour-matching": "node scripts/test-colour-matching.mjs",
     "test:palette-files": "node scripts/test-palette-files.mjs",
     "test:minecraft-assets": "node scripts/test-minecraft-assets.mjs",
+    "test:shape-fitting": "node scripts/test-shape-fitting.mjs",
     "test:metric-scene": "node scripts/test-metric-scene-browser.mjs",
     "test:single-scene": "node scripts/test-single-scene-browser.mjs",
     "benchmark:mesher": "node scripts/benchmark-mesher.mjs",
