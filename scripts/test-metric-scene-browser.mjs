@@ -24,6 +24,23 @@ try {
   await page.locator('#model-picker-btn').click();
   await page.locator('[data-model="single-scene"]').click();
   await page.waitForFunction(() => !!window.singleSceneViewer);
+  assert.equal(await page.locator('#single-scene-texture-limit').inputValue(),'128');
+  report.textureMemory = await page.evaluate(async()=>{
+    const THREE=await import('/node_modules/.vite/deps/three.js');
+    const {limitSourceTextures}=await import('/src/source-textures.js');
+    const image=document.createElement('canvas');image.width=512;image.height=256;
+    const context=image.getContext('2d');context.fillStyle='#2468ac';context.fillRect(0,0,512,256);
+    const texture=new THREE.CanvasTexture(image);
+    const source=new THREE.Mesh(new THREE.BoxGeometry(),new THREE.MeshBasicMaterial({map:texture}));
+    await limitSourceTextures(source,128);
+    const reduced=texture.image;
+    const result={width:reduced.width,height:reduced.height,pixel:[...reduced.getContext('2d').getImageData(0,0,1,1).data],cacheEnabled:THREE.Cache.enabled};
+    const untouched=new THREE.CanvasTexture(image);source.material.map=untouched;
+    await limitSourceTextures(source,0);result.originalPreserved=untouched.image===image;
+    source.geometry.dispose();source.material.dispose();texture.dispose();untouched.dispose();
+    return result;
+  });
+  assert.deepEqual(report.textureMemory,{width:128,height:64,pixel:[36,104,172,255],cacheEnabled:false,originalPreserved:true});
   assert.equal(await page.locator('#minecraft-block-palette #toggle-mc').count(), 1);
   assert.equal(await page.locator('#map-minecraft-textures-slot #toggle-mc').count(), 0);
   assert.equal(await page.locator('#single-scene-scale-mode').inputValue(), 'metric');
@@ -34,7 +51,9 @@ try {
     const THREE = await import('/node_modules/.vite/deps/three.js');
     const { GLTFExporter } = await import('/node_modules/three/examples/jsm/exporters/GLTFExporter.js');
     const scene = new THREE.Scene();
-    const mesh = new THREE.Mesh(new THREE.BoxGeometry(8, 6, 4), new THREE.MeshBasicMaterial({ color: 0x7b858c }));
+    const canvas = document.createElement('canvas'); canvas.width = canvas.height = 2;
+    const context = canvas.getContext('2d'); context.fillStyle = '#ffffff'; context.fillRect(0,0,2,2);
+    const mesh = new THREE.Mesh(new THREE.BoxGeometry(8, 6, 4), new THREE.MeshBasicMaterial({ color: 0x7b858c, map: new THREE.CanvasTexture(canvas) }));
     mesh.position.set(6378137, 0, 0); scene.add(mesh);
     const data = await new GLTFExporter().parseAsync(scene, { binary: true });
     const url = URL.createObjectURL(new Blob([data]));
@@ -78,6 +97,21 @@ try {
   await page.locator('#single-scene-colour-matching').selectOption('accurate');
   await page.waitForFunction(() => document.querySelector('#single-scene-palette-status').textContent.includes('accurate matching'));
   assert.equal(await page.evaluate(() => window.singleSceneViewer.voxelMeshes[0].children[0].material.uniforms.accurateMatching.value), true);
+  assert.equal(await page.locator('#single-scene-colour-priority').inputValue(),'hue');
+  await page.evaluate(()=>{window.priorityMesh=window.singleSceneViewer.voxelMeshes[0];});
+  const warmMatch=()=>page.evaluate(async()=>{
+    const grid={gridSize:{x:1,y:1,z:1},unit:{x:1,y:1,z:1},bbox:{min:[0,0,0],max:[1,1,1]},
+      sparse:{indices:new Float64Array([0]),colors:new Uint32Array([0xff788cd2])}};
+    const result=await window.singleSceneViewer.exportSession.run(grid,'surface-blocks');return result.palette[0];
+  });
+  await page.locator('#single-scene-colour-priority').selectOption('balanced');
+  await page.waitForFunction(()=>window.singleSceneViewer.voxelMeshes[0].children[0].material.uniforms.chromaWeight.value===1);
+  assert.equal(await warmMatch(),'pink_wool');
+  await page.locator('#single-scene-colour-priority').selectOption('hue');
+  await page.waitForFunction(()=>window.singleSceneViewer.voxelMeshes[0].children[0].material.uniforms.chromaWeight.value===2);
+  assert.equal(await warmMatch(),'white_terracotta');
+  assert.ok(await page.evaluate(()=>window.priorityMesh===window.singleSceneViewer.voxelMeshes[0]),'Colour priority changes must reuse the existing voxel geometry');
+  report.colourPriority={balancedWarm:'pink_wool',hueWarm:'white_terracotta',previewWeights:[1,2],sameGeometry:true};
   const beforePalette = await page.evaluate(() => { window.paletteMesh = window.singleSceneViewer.voxelMeshes[0]; return window.singleSceneViewer.voxelizer.voxelCount; });
   await page.locator('[data-block-palette="glazed"]').check();
   await page.waitForFunction(() => document.querySelector('#single-scene-palette-status').textContent.startsWith('65 blocks'));
@@ -148,6 +182,8 @@ try {
   assert.equal(rotated.metadata.rotationDegrees, 90);
   assert.ok(Math.abs(rotated.metersPerBlock - 1) < 1e-10);
   assert.deepEqual(rotated.size, { x: 4, y: 8, z: 6 });
+  assert.ok(await page.evaluate(() => document.querySelector('#single-scene-log').textContent.includes('ownership transfer')));
+  assert.ok(await page.evaluate(() => document.querySelector('#single-scene-log').textContent.includes('Releasing previous voxel preview')));
   await page.locator('#single-scene-meters-per-block').fill('2');
   await page.locator('#single-scene-meters-per-block').dispatchEvent('change');
   await ready();
@@ -212,15 +248,89 @@ try {
   });
   const shaped = nbt.simplify((await nbt.parse(Buffer.from(shapeExport.schematic))).parsed);
   assert.deepEqual([shaped.Width,shaped.Height,shaped.Length],[1,1,1]);
-  assert.ok(Object.keys(shaped.Palette).some(state=>state.includes('_stairs[') && state.includes('half=top')));
+  assert.ok(Object.keys(shaped.Palette).some(state=>state !== 'minecraft:air' && !state.includes('[')), 'Mixed-height upright samples must export as full blocks');
   const shapedNbt = nbt.simplify((await nbt.parse(Buffer.from(shapeExport.nbt))).parsed);
-  assert.ok(shapedNbt.palette.some(entry=>entry.Properties?.half === 'top'));
+  assert.ok(shapedNbt.palette.every(entry=>!entry.Properties));
   assert.equal(shapeExport.manifest.gridSize.x,1);
   assert.equal(shapeExport.manifest.metersPerBlock,1);
   assert.ok(shapeExport.previewMaterials.every(name=>!name.includes('[')), 'GLB exports the source sample preview, not fitted blocks');
   assert.ok(shapeExport.messages.some(message=>message.includes('Shape fit:')));
   report.shapeDetail = {sampleSpacing:detail.metersPerBlock,finalBlockSpacing:detail.metadata.metersPerBlock,
     palette:Object.keys(shaped.Palette),stats:JSON.parse(shaped.Metadata.VoxelEarth).shapeFit};
+  await page.locator('#single-scene-shape-detail').uncheck();
+  await ready();
+  await page.evaluate(async()=>{
+    const THREE=await import('/node_modules/.vite/deps/three.js');
+    const {GLTFExporter}=await import('/node_modules/three/examples/jsm/exporters/GLTFExporter.js');
+    const {ecefPosition}=await import('/src/geographic-markers.js');
+    const center=ecefPosition(50.82,-.14,0),up=center.clone().normalize();
+    const east=new THREE.Vector3(-center.y,center.x,0).normalize(),south=new THREE.Vector3().crossVectors(up,east).negate();
+    const frame=new THREE.Matrix4().set(east.x,east.y,east.z,0,up.x,up.y,up.z,0,south.x,south.y,south.z,0,0,0,0,1);
+    const scene=new THREE.Scene(),mesh=new THREE.Mesh(new THREE.BoxGeometry(8,6,4),new THREE.MeshBasicMaterial({color:0x8899aa}));
+    mesh.position.copy(center);mesh.quaternion.setFromRotationMatrix(frame.invert());
+    const gltfYUp=new THREE.Group();gltfYUp.rotation.x=-Math.PI/2;gltfYUp.add(mesh);scene.add(gltfYUp);
+    const data=await new GLTFExporter().parseAsync(scene,{binary:true}),url=URL.createObjectURL(new Blob([data]));
+    await window.singleSceneViewer.loadGLTFTiles([url]);URL.revokeObjectURL(url);
+    window.singleSceneViewer.captureMetadata={latitude:50.82,longitude:-.14,radiusMeters:750};
+  });
+  await page.locator('#single-scene-marker-height').fill('25');
+  await page.locator('#single-scene-geo-markers').check();
+  await ready();
+  const markers=()=>page.evaluate(()=>{
+    const v=window.singleSceneViewer;
+    return {markers:v.voxelizer._voxelGrid.exportMetadata.geographicMarkers.markers,
+      instances:v.voxelMeshes[0].getObjectByName('geographicAlignmentMarkers').count};
+  });
+  const normalMarkers=await markers();
+  assert.ok((await page.locator('#single-scene-log').textContent()).includes('Geographic frame: glTF Y-up'));
+  assert.equal(await page.evaluate(()=>window.singleSceneViewer.voxelMeshes[0].getObjectByName('geographicMarkerOverlay')===undefined),true);
+  assert.ok(normalMarkers.instances>=20,'750m request must generate markers even when the loaded model footprint is tiny');
+  assert.ok((await page.locator('#single-scene-marker-status').textContent()).includes('solid red blocks voxelized'));
+  const previousPose=await page.evaluate(()=>{
+    const v=window.singleSceneViewer;return {position:v.camera.position.toArray(),target:v.controls.target.toArray(),near:v.camera.near,far:v.camera.far};
+  });
+  await page.locator('#single-scene-frame-markers').click();
+  assert.equal(await page.locator('#single-scene-frame-markers').textContent(),'Restore previous view');
+  const fits=await page.evaluate(async()=>{
+    const THREE=await import('/node_modules/.vite/deps/three.js');
+    const v=window.singleSceneViewer,b=v.voxelizer._voxelGrid.bbox;
+    const min=Array.isArray(b.min)?b.min:[b.min.x,b.min.y,b.min.z],max=Array.isArray(b.max)?b.max:[b.max.x,b.max.y,b.max.z];
+    v.camera.updateMatrixWorld(true);
+    const corners=[];for(const x of [min[0],max[0]])for(const y of [min[1],max[1]])for(const z of [min[2],max[2]])corners.push(new THREE.Vector3(x,y,z).project(v.camera).toArray());
+    return {corners,visible:v.voxelMeshes[0].visible};
+  });
+  assert.ok(fits.visible);
+  assert.ok(fits.corners.every(p=>p.every(Number.isFinite)&&p.every(c=>Math.abs(c)<=1)), 'Framing must keep the entire terrain and underground marker extent in view');
+  await page.locator('#single-scene-frame-markers').click();
+  assert.equal(await page.locator('#single-scene-frame-markers').textContent(),'Frame markers');
+  const restoredPose=await page.evaluate(()=>{
+    const v=window.singleSceneViewer;return {position:v.camera.position.toArray(),target:v.controls.target.toArray(),near:v.camera.near,far:v.camera.far};
+  });
+  for(const key of ['position','target'])for(let i=0;i<3;i++)assert.ok(Math.abs(previousPose[key][i]-restoredPose[key][i])<1e-9);
+  assert.equal(restoredPose.near,previousPose.near);assert.equal(restoredPose.far,previousPose.far);
+  await page.locator('#single-scene-shape-detail').check();
+  await ready();
+  const slabMarkers=await markers();
+  assert.deepEqual(slabMarkers,normalMarkers,'Geographic marker positions and full-block indices must match across sample modes');
+  const markerFile=await page.evaluate(async()=>{
+    const v=window.singleSceneViewer;
+    const file=await v.exportSession.run(v.voxelizer._voxelGrid,'schem');
+    return [...new Uint8Array(await new Blob(file.fileParts).arrayBuffer())];
+  });
+  const markerSchematic=nbt.simplify((await nbt.parse(Buffer.from(markerFile))).parsed);
+  assert.ok('minecraft:red_concrete' in markerSchematic.Palette);
+  report.geographicMarkers=slabMarkers;
+  await page.evaluate(()=>{
+    window.singleSceneViewer.captureMetadata={latitude:-33.86,longitude:151.2,radiusMeters:750};
+    document.querySelector('#single-scene-meters-per-block').dispatchEvent(new Event('change'));
+  });
+  await ready();
+  assert.equal(await page.evaluate(()=>window.singleSceneViewer.voxelizer._voxelGrid.exportMetadata.shapeSampling),2);
+  assert.ok(await page.evaluate(()=>window.singleSceneViewer.voxelMeshes.length>0));
+  assert.ok((await page.locator('#single-scene-marker-status').textContent()).includes('Terrain preview ready; markers unavailable'));
+  await page.evaluate(()=>{window.singleSceneViewer.captureMetadata={latitude:50.82,longitude:-.14,radiusMeters:750};});
+  await page.locator('#single-scene-geo-markers').uncheck();
+  await ready();
   await page.locator('#single-scene-shape-detail').uncheck();
   await ready();
   await page.screenshot({ path: 'output/playwright/metric-scene-desktop.png' });

@@ -53,19 +53,17 @@ geometry.dispose(); model.material.dispose();
 
 // Independent allocating reference, including premultiplied-alpha interpolation.
 function reference(image, tex, uv, srgb) {
-  let u = uv.x * tex.repeat.x + tex.offset.x, v = uv.y * tex.repeat.y + tex.offset.y;
-  if (tex.rotation) {
-    u -= tex.center.x; v -= tex.center.y;
-    [u, v] = [u * Math.cos(tex.rotation) - v * Math.sin(tex.rotation) + tex.center.x,
-      u * Math.sin(tex.rotation) + v * Math.cos(tex.rotation) + tex.center.y];
-  }
-  const wrap = (x, m) => m === 1000 ? ((x % 1) + 1) % 1 : Math.max(0, Math.min(1, x));
+  const matrix=new THREE.Matrix3().setUvTransform(tex.offset.x,tex.offset.y,tex.repeat.x,tex.repeat.y,tex.rotation,tex.center.x,tex.center.y);
+  const transformed=new THREE.Vector3(uv.x,uv.y,1).applyMatrix3(matrix);
+  let u=transformed.x,v=transformed.y;
+  const wrap = (x, m) => m === 1000 ? ((x % 1) + 1) % 1 : m===1002?1-Math.abs((((x%2)+2)%2)-1):Math.max(0, Math.min(1, x));
   u = wrap(u, tex.wrapS); v = wrap(v, tex.wrapT); if (tex.flipY) v = 1 - v;
-  const x = u * (image.width - 1), y = v * (image.height - 1), x0 = Math.floor(x), y0 = Math.floor(y), tx = x - x0, ty = y - y0;
+  const x = u * image.width-.5, y = v * image.height-.5, x0 = Math.floor(x), y0 = Math.floor(y), tx = x - x0, ty = y - y0;
   const out = [0, 0, 0, 0];
-  for (const [ix, iy, w] of [[x0, y0, (1 - tx) * (1 - ty)], [Math.min(image.width - 1, x0 + 1), y0, tx * (1 - ty)],
-    [x0, Math.min(image.height - 1, y0 + 1), (1 - tx) * ty], [Math.min(image.width - 1, x0 + 1), Math.min(image.height - 1, y0 + 1), tx * ty]]) {
-    const at = (iy * image.width + ix) * 4, alpha = image.data[at + 3] / 255;
+  for (const [ix, iy, w] of [[x0, y0, (1 - tx) * (1 - ty)], [x0 + 1, y0, tx * (1 - ty)],
+    [x0,y0 + 1, (1 - tx) * ty], [x0 + 1,y0 + 1,tx * ty]]) {
+    const address=(i,n,mode)=>mode===1000?((i%n)+n)%n:Math.max(0,Math.min(n-1,i));
+    const at = (address(iy,image.height,tex.wrapT) * image.width + address(ix,image.width,tex.wrapS)) * 4, alpha = image.data[at + 3] / 255;
     for (let c = 0; c < 3; c++) {
       let value = image.data[at + c] / 255;
       if (srgb) value = value <= 0.04045 ? value / 12.92 : ((value + 0.055) / 1.055) ** 2.4;
@@ -79,7 +77,7 @@ function reference(image, tex, uv, srgb) {
 let seed = 42;
 const random = () => { seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0; return seed / 2 ** 32; };
 const image = { width: 7, height: 5, data: Uint8Array.from({ length: 7 * 5 * 4 }, () => Math.floor(random() * 256)) };
-for (const srgb of [false, true]) for (const flipY of [false, true]) for (const rotation of [0, 0.4]) for (const wrapS of [1000, 1001]) {
+for (const srgb of [false, true]) for (const flipY of [false, true]) for (const rotation of [0, 0.4]) for (const wrapS of [1000, 1001,1002]) {
   const tex = { repeat: { x: 1.3, y: 0.7 }, offset: { x: 0.1, y: -0.2 }, center: { x: 0.5, y: 0.5 }, rotation, flipY, wrapS, wrapT: wrapS };
   const sample = createVoxelTextureSampler(image, tex, srgb);
   for (let i = 0; i < 100; i++) {
@@ -91,4 +89,4 @@ for (const srgb of [false, true]) for (const flipY of [false, true]) for (const 
 image.data.fill(0);
 const tex = { repeat: { x: 1, y: 1 }, offset: { x: 0, y: 0 }, center: { x: 0, y: 0 }, rotation: 0, flipY: false };
 assert.deepEqual(createVoxelTextureSampler(image, tex, true)({ x: 0.5, y: 0.5 }), [0, 0, 0, 0]);
-console.log('Textured voxels: 3,200 reference samples, alpha, transforms, normalized/interleaved GLTF and streamed URL resolution passed.');
+console.log('Textured voxels: 4,800 reference samples, alpha, Three.js UV transforms, clamp/repeat/mirror, normalized/interleaved GLTF and streamed URL resolution passed.');

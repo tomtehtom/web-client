@@ -30,11 +30,13 @@ import {
   getMinecraftBrightnessBias,
   getPackedBlockResources,
   configureBlockPalette, getBlockPaletteKey, BLOCKS,
-  setBlockMatchingMode, getMinecraftBlockCatalog, setBlockColourProfile
+  setBlockMatchingMode, getMinecraftBlockCatalog, setBlockColourProfile, setBlockChromaWeight
 } from './assignToBlocksForGLB.js';
 import { DEFAULT_BLOCK_PALETTE, normalizeBlockPalette, parseBlockPalette, exportBlockCatalog } from './block-palette.js';
 import { SingleSceneViewer } from './SingleSceneViewer.js';
 import { SingleSceneFetcher } from './SingleSceneFetcher.js';
+import { clampSourceAtlasEdges } from './source-textures.js';
+import { planGeographicMarkers, attachGeographicMarkers, markerPreview, markerVoxelizationSource } from './geographic-markers.js';
 import { getActiveServerUrl, isLocalServer, resolveEarthTileUrl } from './config.js';
 
 const LEGACY_SRGB_ENCODING = 3001;
@@ -427,6 +429,19 @@ class HUD {
     const scaleMode = document.querySelector('#single-scene-scale-mode');
     const metersInput = document.querySelector('#single-scene-meters-per-block');
     const shapeDetail = document.querySelector('#single-scene-shape-detail');
+    const geoMarkers = document.querySelector('#single-scene-geo-markers');
+    const markerHeight = document.querySelector('#single-scene-marker-height');
+    document.querySelector('#single-scene-frame-markers').addEventListener('click',()=>{
+      const viewer=window.singleSceneViewer;
+      const markers=viewer?.voxelMeshes[0]?.getObjectByName('geographicAlignmentMarkers');
+      if(markers?.count) {
+        const framed=viewer.toggleMarkerView();
+        document.querySelector('#single-scene-frame-markers').textContent=framed?'Restore previous view':'Frame markers';
+      }
+      else document.querySelector('#single-scene-marker-status').textContent='No markers generated yet. Enable geographic markers and rebuild. Check the progress log if generation fails.';
+    });
+    geoMarkers.checked = localStorage.getItem('geographicMarkers') === 'true';
+    markerHeight.value = localStorage.getItem('geographicMarkerDepth') ?? '25';
     const scaleSummary = document.querySelector('#single-scene-scale-summary');
     const markSettingsChanged = () => {
       const viewer = window.singleSceneViewer;
@@ -440,6 +455,8 @@ class HUD {
       const metric = scaleMode.value === 'metric';
       metersInput.disabled = !metric;
       shapeDetail.disabled = !metric;
+      geoMarkers.disabled = !metric;
+      markerHeight.disabled = !metric;
       document.querySelector('#single-scene-density-controls').classList.toggle('hidden', metric);
       [resFine, resInput, ...resPills].forEach(el => { if (el) el.disabled = metric; });
       scaleSummary.textContent = metric ? `1 block = ${metersInput.value} metre(s)` : 'Scale depends on tile density';
@@ -455,11 +472,16 @@ class HUD {
     scaleMode.addEventListener('change', rebuildScale);
     metersInput.addEventListener('change', rebuildScale);
     shapeDetail.addEventListener('change', rebuildScale);
+    geoMarkers.addEventListener('change', () => { localStorage.setItem('geographicMarkers',geoMarkers.checked); rebuildScale(); });
+    markerHeight.addEventListener('change', () => { if (!markerHeight.checkValidity()) {markerHeight.reportValidity();return;} localStorage.setItem('geographicMarkerDepth',markerHeight.value); rebuildScale(); });
     document.querySelector('#single-scene-rebuild').addEventListener('click', () => this._rebuildSingleSceneVoxels(this.getSingleSceneRes()));
     updateScaleUI();
     const paletteChecks = [...document.querySelectorAll('[data-block-palette]')];
     const matchingSelect = document.querySelector('#single-scene-colour-matching');
     const profileSelect = document.querySelector('#single-scene-colour-profile');
+    const prioritySelect = document.querySelector('#single-scene-colour-priority');
+    prioritySelect.value=localStorage.getItem('minecraftColourPriority')==='balanced'?'balanced':'hue';
+    setBlockChromaWeight(prioritySelect.value==='hue'?2:1);
     profileSelect.value = ['balanced', 'top', 'sides'].includes(localStorage.getItem('minecraftColourProfile')) ? localStorage.getItem('minecraftColourProfile') : 'balanced';
     setBlockColourProfile(profileSelect.value);
     matchingSelect.value = localStorage.getItem('minecraftBlockMatching') === 'fast' ? 'fast' : 'accurate';
@@ -488,9 +510,11 @@ class HUD {
       document.querySelector('#palette-reset').classList.toggle('hidden', !customNames);
       setBlockMatchingMode(matchingSelect.value);
       setBlockColourProfile(profileSelect.value);
+      setBlockChromaWeight(prioritySelect.value==='hue'?2:1);
       if (save) localStorage.setItem('minecraftBlockPalette', JSON.stringify(options));
       if (save) localStorage.setItem('minecraftBlockMatching', matchingSelect.value);
       if (save) localStorage.setItem('minecraftColourProfile', profileSelect.value);
+      if (save) localStorage.setItem('minecraftColourPriority',prioritySelect.value);
       if (save) {
         if (customNames) localStorage.setItem('minecraftCustomBlocks', JSON.stringify(customNames));
         else localStorage.removeItem('minecraftCustomBlocks');
@@ -511,6 +535,7 @@ class HUD {
     paletteChecks.forEach(check => check.addEventListener('change', () => updatePalette()));
     matchingSelect.addEventListener('change', () => updatePalette());
     profileSelect.addEventListener('change', () => updatePalette());
+    prioritySelect.addEventListener('change', () => updatePalette());
     const fileStatus = document.querySelector('#palette-file-status');
     const downloadPalette = (value, filename) => downloadExport(new TextEncoder().encode(JSON.stringify(value, null, 2) + '\n'), filename);
     document.querySelector('#palette-export-all').addEventListener('click', async () => {
@@ -1046,7 +1071,7 @@ class HUD {
     const vox = container.getObjectByName('singleSceneVoxels');
     container.children.forEach(ch => {
       if (vox && ch === vox) ch.visible = !!showVoxels;
-      else ch.visible = !showVoxels || !vox;
+      else ch.visible = !showVoxels;
     });
   }
 
@@ -1064,19 +1089,36 @@ class HUD {
     viewer.voxelSettingsCurrent = false;
 
     this._ssVoxVersion = (this._ssVoxVersion ?? 0) + 1;
+    if(viewer._markerView)viewer.toggleMarkerView();
+    document.querySelector('#single-scene-frame-markers').textContent='Frame markers';
     const myVersion = this._ssVoxVersion;
     const started = performance.now();
     const log = message => (viewer.captureLog ?? this._logSingleScene.bind(this))(`[Voxel ${myVersion} +${((performance.now() - started) / 1000).toFixed(1)}s] ${message}`);
 
     viewer._voxelController?.terminate();
-    // Keep the previous preview until the replacement is ready. Serialize only
-    // original sources, never the packed preview attached alongside them.
-    const old = container.getObjectByName('singleSceneVoxels');
+    viewer.camera.layers.disable(0);
+    // Large captures cannot retain both previews/export grids during a rebuild.
+    // Keep the downloaded source, but release the previous voxel result first.
+    let old = container.getObjectByName('singleSceneVoxels');
+    viewer.exportSession.dispose();
+    if (old) {
+      log('Releasing previous voxel preview and export grid before rebuilding…');
+      dispose(old);
+      old = null;
+      viewer.voxelMeshes = [];
+      viewer.voxelizer = null;
+      viewer.renderer.renderLists.dispose();
+      await new Promise(resolve => requestAnimationFrame(resolve));
+      if (myVersion !== this._ssVoxVersion || viewer.destroyed || viewer.tilesContainer !== container) return;
+    }
+    viewer.alignGeographicFrame(log);
     container.updateMatrixWorld(true);
     const source = new THREE.Group();
     source.matrix.copy(container.matrixWorld); source.matrixAutoUpdate = false;
     for (const child of container.children) if (child !== old) source.add(child.clone(true));
     source.updateMatrixWorld(true);
+    const clampedAtlases=clampSourceAtlasEdges(source);
+    if(clampedAtlases)log(`Protected ${clampedAtlases} single-tile texture atlas edges from colour wrapping.`);
     const containerBox = new THREE.Box3().setFromObject(source);
     const containerSize = containerBox.getSize(new THREE.Vector3());
     const maxDim = Math.max(containerSize.x, containerSize.y, containerSize.z, 1);
@@ -1103,7 +1145,27 @@ class HUD {
     }
     log(metric ? `Voxelizing at exactly ${metersPerBlock} metre(s) per block, rotation ${rotDeg}°…`
       : `Voxelizing at density ${densitySetting}, rotation ${rotDeg}°…`);
-    if (shapeSampling === 2) log(`Slab/stair detail: ${metersPerBlock / 2} m samples, 2 × 2 × 2 per exported block. Preview shows samples; Minecraft export fits shapes.`);
+    if (shapeSampling === 2) log(`Slab height detail: ${metersPerBlock / 2} m samples, 2 × 2 × 2 per exported block. Horizontal slabs; vertical features become full blocks. Preview shows samples.`);
+    let markerPlans = [];
+    let markerError = '';
+    let voxelSource=source,sourceRotation=rotDeg;
+    if (metric && document.querySelector('#single-scene-geo-markers').checked) {
+      try {
+        viewer.rotationCenter = containerBox.getCenter(new THREE.Vector3());
+        markerPlans = planGeographicMarkers(viewer,rotDeg,metersPerBlock,Number(document.querySelector('#single-scene-marker-height').value),containerBox);
+        if(markerPlans.length) {
+          voxelSource=markerVoxelizationSource(source,markerPlans,rotDeg,viewer.rotationCenter,metersPerBlock/viewerMeters);
+          sourceRotation=0;
+        }
+        log(`Adding ${markerPlans.length} fixed geographic markers, approximately 250 m apart. Same lat/lon IDs across captures; full red blocks in both sample modes.`);
+      } catch (error) {
+        viewer.camera.layers.enable(0);
+        markerError=error.message;
+        markerPlans=[];
+        document.querySelector('#single-scene-marker-status').textContent=`Marker generation failed: ${error.message}`;
+        log(`Markers unavailable: ${error.message} Continuing terrain voxelization.`);
+      }
+    }
 
     let vox;
     let lastStage = 'Preparing source geometry';
@@ -1112,7 +1174,7 @@ class HUD {
     }, 3000);
     try {
       vox = await voxelizeModel({
-        model: source,
+        model: voxelSource,
         renderer: viewer.renderer,
         scene: viewer.scene,
         resolution: computedResolution,
@@ -1128,12 +1190,14 @@ class HUD {
           if (myVersion !== this._ssVoxVersion || viewer.destroyed) return;
           lastStage = message; log(message);
         },
-        preRotateYDeg: rotDeg
+        preRotateYDeg: sourceRotation
       });
     } catch (e) {
+      viewer.camera.layers.enable(0);
+      if(myVersion === this._ssVoxVersion && markerPlans.length)document.querySelector('#single-scene-marker-status').textContent=`Voxelization failed: ${e?.message || e}`;
       if (myVersion === this._ssVoxVersion) log(`Voxelization failed: ${e?.message || e}`);
       return;
-    } finally { clearInterval(heartbeat); }
+    } finally { clearInterval(heartbeat);voxelSource.userData.disposeMarkerSource?.(); }
 
     if (vox?.stats?.fallbackReason) {
       this._logSingleScene(`? ${vox.stats.fallbackReason}`);
@@ -1161,8 +1225,19 @@ class HUD {
       metersPerBlock: metric ? metersPerBlock : rawGrid.unit.x * viewerMeters,
       scaleMode: metric ? 'metric' : 'density', rotationDegrees: rotDeg,
       shapeSampling,
+      ...(markerError?{geographicMarkerError:markerError}:{}),
       rotationConvention: 'Positive Y rotation: east turns toward north; north turns toward west.',
     };
+    if (rawGrid && markerPlans.length) {
+      attachGeographicMarkers(rawGrid,markerPlans,shapeSampling);
+      const markers=markerPreview(rawGrid);
+      voxelMesh.add(markers);
+    }
+    document.querySelector('#single-scene-marker-status').textContent=markerError?`Terrain preview ready; markers unavailable: ${markerError}`:markerPlans.length
+      ? `${markerPlans.length} solid red blocks voxelized ${Number(document.querySelector('#single-scene-marker-height').value)} blocks below the scan. Orbit below the terrain to inspect them.`
+      : document.querySelector('#single-scene-geo-markers').checked
+        ? 'No 250 m grid intersections inside the requested radius. Check the requested location and radius.'
+        : 'Geographic markers are off. Enable them and rebuild.';
 
     // Preserve original vertex-color material BEFORE any MC swap
     voxelMesh.traverse(n => { if (n.isMesh && !n.userData.origMat) n.userData.origMat = n.material; });
@@ -1193,9 +1268,10 @@ class HUD {
 
     // Respect global voxel visibility
     this._setSingleSceneVisibility(!!state.vox);
+    viewer.camera.layers.enable(0);
 
     const dims = rawGrid?.gridSize;
-    const summary = dims ? `${dims.x} × ${dims.y} × ${dims.z} ${shapeSampling === 2 ? 'half-block samples' : 'blocks'}; ${rawGrid.exportMetadata.metersPerBlock.toFixed(3)} m/block; ${rotDeg}°${shapeSampling === 2 ? '; slab/stair export' : ''}` : 'Preview ready';
+    const summary = dims ? `${dims.x} × ${dims.y} × ${dims.z} ${shapeSampling === 2 ? 'half-block samples' : 'blocks'}; ${rawGrid.exportMetadata.metersPerBlock.toFixed(3)} m/block; ${rotDeg}°${shapeSampling === 2 ? '; slab height export' : ''}` : 'Preview ready';
     document.querySelector('#single-scene-scale-summary').textContent = summary;
     log(`✅ ${vox.voxelCount ?? '—'} occupied blocks. ${summary}`);
     if (vox.stats) log(`Stage timings: geometry ${(vox.stats.bakeMs / 1000).toFixed(1)}s; raster ${(vox.stats.rasterMs / 1000).toFixed(1)}s; colours/mesh ${(vox.stats.meshMs / 1000).toFixed(1)}s; export grid ${(vox.stats.gridExportMs / 1000).toFixed(1)}s`);
@@ -2203,7 +2279,7 @@ function dispose(o) {
   const materials = new Set();
   if (o.traverse && typeof o.traverse === 'function') {
     o.traverse(n => {
-      if (n.isMesh) {
+      if (n.isMesh || n.isPoints) {
         n.geometry?.dispose();
         for (const material of [n.material, n.userData?.origMat, n.userData?.mcMat].flat()) {
           if (material) materials.add(material);

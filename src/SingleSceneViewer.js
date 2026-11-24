@@ -6,6 +6,9 @@ import { KTX2Loader }   from 'three/examples/jsm/loaders/KTX2Loader.js';
 import { MeshoptDecoder } from 'three/examples/jsm/libs/meshopt_decoder.module.js';
 import { GLTFExporter } from 'three/addons/exporters/GLTFExporter.js';
 import { loadGltfBatch } from './loadGltfBatch.js';
+import { CaptureProgress } from './capture-progress.js';
+import { limitSourceTextures, clampSourceAtlasEdges } from './source-textures.js';
+import { resolveCaptureFrame } from './geographic-markers.js';
 import { VoxelExportSession, makeExportGroup, downloadExport } from './voxel-export.js';
 import { getPackedBlockResources, getMinecraftBrightnessBias, getBlockPaletteKey } from './assignToBlocksForGLB.js';
 import { setPackedVoxelTextures } from './packed-voxel-renderer.js';
@@ -76,8 +79,10 @@ export class SingleSceneViewer {
 		loader.setDRACOLoader(draco);
 		loader.setKTX2Loader(ktx2);
 		loader.setMeshoptDecoder(MeshoptDecoder);
-		// Enable three.js in-memory cache to short-circuit duplicate GLB / texture fetches this session
-		THREE.Cache.enabled = true;
+		// HTTP caching remains available. Avoid a second unbounded JS cache of
+		// every compressed GLB and decoded ImageBitmap in a large capture.
+		THREE.Cache.enabled = false;
+		THREE.Cache.clear();
 		return loader;
 	}
 
@@ -97,6 +102,10 @@ export class SingleSceneViewer {
 	}
 
 	async loadGLTFTiles(urlArray, logFn) {
+		const requestedSize = Number(document.querySelector('#single-scene-texture-limit')?.value ?? 128);
+		const textureLimit = [0,128,256,512].includes(requestedSize) ? requestedSize : 128;
+		const reducedImages = new WeakMap();
+		logFn?.(`Source textures: ${textureLimit ? `${textureLimit}px maximum edge (memory saver; reduces texture detail)` : 'original resolution (high memory use)'}. Geometry and voxel spacing unchanged.`);
 		const version = this._loadVersion = (this._loadVersion ?? 0) + 1;
 		this._voxelController?.terminate();
 		this.exportSession.dispose();
@@ -112,18 +121,29 @@ export class SingleSceneViewer {
 		// Fetch individual glTFs with bounded parallelism instead of serial network waits
 		let latest = { loaded: 0, failed: 0 }, lastLog = 0;
 		const started = performance.now();
+		const progress = new CaptureProgress(started);
 		const reportLoad = () => {
 			if (this.destroyed || this._loadVersion !== version) return;
 			lastLog = performance.now();
-			logFn?.(`Downloading/decoding models: ${latest.loaded + latest.failed}/${urlArray.length} finished, ${latest.failed} failed; ${((lastLog - started) / 1000).toFixed(1)}s elapsed`);
+			const finished = latest.loaded + latest.failed;
+			const eta = progress.estimate(finished, urlArray.length - finished, lastLog);
+			logFn?.(`Downloading/decoding models: ${finished}/${urlArray.length} finished, ${latest.failed} failed; ${eta.rate.toFixed(1)} models/s; download/decode ETA ${eta.text}; ${((lastLog - started) / 1000).toFixed(1)}s elapsed`);
 		};
 		reportLoad();
 		const heartbeat = setInterval(reportLoad, 2000);
 		let batch;
 		try { batch = await loadGltfBatch({
 			urls: urlArray,
-			concurrency: matchMedia('(pointer: coarse)').matches ? 3 : 8,
-			loadOne: (url) => new Promise((res, rej) => this.gltfLoader.load(url, res, undefined, rej)),
+			concurrency: matchMedia('(pointer: coarse)').matches ? 3 : textureLimit ? 16 : 8,
+			loadOne: async (url) => {
+				const gltf = await new Promise((res, rej) => this.gltfLoader.load(url, res, undefined, rej));
+				clampSourceAtlasEdges(gltf.scene);
+				await limitSourceTextures(gltf.scene, textureLimit, reducedImages);
+				// The parser retains GLB buffers and intermediate decode caches after
+				// loading. Only keep the finished scene/metadata in the capture.
+				const { parser, ...loaded } = gltf;
+				return loaded;
+			},
 			onProgress: ({ index, total, loaded, failed, ok, error }) => {
 				latest = { loaded, failed };
 				if (!ok && failed <= 5) logFn?.(`Skipped glTF ${index + 1}/${total} (${error?.message ?? 'load error'})`);
@@ -142,6 +162,9 @@ export class SingleSceneViewer {
 			return;
 		}
 		for (const gltf of gltfArray) {
+			// No transient upload of the entire photorealistic scene before the
+			// voxel toggle gets a chance to hide it. Source view enables layer 0.
+			gltf.scene.visible = false;
 			tilesContainer.add(gltf.scene);
 		}
 		if (!gltfArray.length) {
@@ -163,6 +186,7 @@ export class SingleSceneViewer {
 		const sizeVec = box.getSize(new THREE.Vector3());
 		const diag = sizeVec.length() || 1;
 		const center = box.getCenter(new THREE.Vector3());
+		this.rawSourceCenter=center.toArray();
 		const ecefUp = center.clone().normalize(); // keep before moving
 		this.metersPerViewerUnit = diag;
 		// move each child by -center (do NOT move the container) so transform order matches the main viewer
@@ -182,6 +206,8 @@ export class SingleSceneViewer {
 			ecefUp.x, ecefUp.y, ecefUp.z, 0,
 			-north.x, -north.y, -north.z, 0,
 			0, 0, 0, 1);
+		this.ecefCenter = center.toArray();
+		this.ecefFrame = frame.toArray();
 		tilesContainer.quaternion.setFromRotationMatrix(frame);
 
 		// Normalize scale ~[0,1]
@@ -204,6 +230,18 @@ export class SingleSceneViewer {
 				this._frame(tilesContainer);
 	}
 
+	alignGeographicFrame(log) {
+		const {latitude,longitude,radiusMeters}=this.captureMetadata??{};
+		if(!this.rawSourceCenter||!Number.isFinite(latitude)||!Number.isFinite(longitude))return false;
+		const resolved=resolveCaptureFrame(this.rawSourceCenter,latitude,longitude,radiusMeters);
+		if(!resolved)return false;
+		this.ecefCenter=resolved.center.toArray();this.ecefFrame=resolved.frame.toArray();
+		this.tilesContainer.quaternion.setFromRotationMatrix(resolved.sourceToView);
+		this.tilesContainer.updateMatrixWorld(true);
+		log?.(`Geographic frame: ${resolved.name}; loaded centre ${Math.round(resolved.distance)} m from requested lat/lon.`);
+		return true;
+	}
+
 	_frame(object3D) {
 		const { camera, controls } = this;
 		const box = new THREE.Box3().setFromObject(object3D);
@@ -213,9 +251,43 @@ export class SingleSceneViewer {
 		const maxDim = Math.max(size.x, size.y, size.z);
 		const fov    = THREE.MathUtils.degToRad(camera.fov);
 		const dist   = Math.max(0.6, (maxDim * 0.5) / Math.tan(fov * 0.5));
+		camera.far = Math.max(100,dist*5+box.getSize(new THREE.Vector3()).length());
+		camera.updateProjectionMatrix();
+		controls.maxDistance = Math.max(5,dist*4);
 		camera.position.copy(center).add(new THREE.Vector3(dist, dist * 0.4, dist));
 		controls.target.copy(center);
 		controls.update();
+	}
+
+	toggleMarkerView() {
+		const {camera,controls}=this;
+		if(this._markerView) {
+			const saved=this._markerView;this._markerView=null;
+			camera.position.copy(saved.position);controls.target.copy(saved.target);
+			camera.near=saved.near;camera.far=saved.far;
+			controls.minDistance=saved.minDistance;controls.maxDistance=saved.maxDistance;
+			camera.updateProjectionMatrix();controls.update();
+			return false;
+		}
+		const grid=this.voxelizer?._voxelGrid;
+		if(!grid?.editorMarkers?.length)return false;
+		const vector=value=>Array.isArray(value)||ArrayBuffer.isView(value)?new THREE.Vector3().fromArray(value):new THREE.Vector3(value.x,value.y,value.z);
+		// Grid bounds are already in the rendered worker coordinate frame. Avoid
+		// deriving them from instanced children under inverse container transforms.
+		const box=new THREE.Box3(vector(grid.bbox.min),vector(grid.bbox.max));
+		const center=box.getCenter(new THREE.Vector3()),radius=box.getSize(new THREE.Vector3()).length()/2;
+		if(![...center.toArray(),radius].every(Number.isFinite)||radius<=0)return false;
+		this._markerView={position:camera.position.clone(),target:controls.target.clone(),near:camera.near,far:camera.far,
+			minDistance:controls.minDistance,maxDistance:controls.maxDistance};
+		const vertical=THREE.MathUtils.degToRad(camera.fov)/2;
+		const horizontal=Math.atan(Math.tan(vertical)*camera.aspect);
+		const distance=radius/Math.sin(Math.min(vertical,horizontal))*1.15;
+		camera.position.copy(center).addScaledVector(new THREE.Vector3(1,.8,1).normalize(),distance);
+		controls.target.copy(center);
+		camera.near=Math.max(1e-6,radius/10000);camera.far=Math.max(100,distance+radius*4);
+		controls.minDistance=Math.min(.1,radius/100);controls.maxDistance=Math.max(5,distance*4);
+		camera.updateProjectionMatrix();controls.update();
+		return true;
 	}
 
 	async generateCombineGltf() {
@@ -257,6 +329,7 @@ export class SingleSceneViewer {
 	}
 
 	clearContent() {
+		this._markerView=null;
 		const materials = new Set(), textures = new Set();
 		this.tilesContainer?.traverse(node => {
 			node.geometry?.dispose();

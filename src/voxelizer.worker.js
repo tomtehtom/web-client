@@ -1,5 +1,6 @@
 import { createVoxelTextureSampler } from './voxel-texture-sampler.js';
 import { batchPackedVoxelChunks } from './packed-voxel-batching.js';
+import { SparseVoxelHits } from './voxel-hit-store.js';
 /* voxelizer.worker.js (REPLACEMENT) */
 
 import * as THREE from 'three';
@@ -246,7 +247,7 @@ class VoxelHitStore {
             this.distances = new Float32Array(total);
             this.distances.fill(Infinity);
         } else {
-            this.map = new Map();
+            this.sparse = new SparseVoxelHits();
         }
     }
 
@@ -266,18 +267,9 @@ class VoxelHitStore {
             return false;
         }
 
-        const prev = this.map.get(index);
-        if (!prev) {
-            this.map.set(index, { tri, dist2 });
-            this.size += 1;
-            return true;
-        }
-        if (dist2 < prev.dist2) {
-            prev.tri = tri;
-            prev.dist2 = dist2;
-            return true;
-        }
-        return false;
+        const changed = this.sparse.setIfCloser(index, tri, dist2);
+        this.size = this.sparse.size;
+        return changed;
     }
 
     forEach(callback) {
@@ -291,9 +283,7 @@ class VoxelHitStore {
             return;
         }
 
-        for (const [index, hit] of this.map.entries()) {
-            callback(index, hit.tri, hit.dist2);
-        }
+        this.sparse.forEach(callback);
     }
 }
 
@@ -2330,6 +2320,7 @@ export class WorkerVoxelizer {
         const e0 = new THREE.Vector3(), e1 = new THREE.Vector3(), e2 = new THREE.Vector3();
         const n = new THREE.Vector3(), absN = new THREE.Vector3();
         const axisTmp = new THREE.Vector3();
+        const invVoxelSize = 1 / this.voxelSize;
 
         const numTriangles = this.indices.length / 3;
         for (let i = 0; i < numTriangles; i++) {
@@ -2338,14 +2329,21 @@ export class WorkerVoxelizer {
             v1.fromArray(this.positions, this.indices[i*3 + 1] * 3);
             v2.fromArray(this.positions, this.indices[i*3 + 2] * 3);
 
+            // SAT tolerances must follow voxel spacing, not the arbitrary
+            // normalized viewer scale. Small valid source triangles otherwise
+            // fall below a world-space area cutoff in kilometre-wide captures.
+            v0.sub(this.bbox.min).multiplyScalar(invVoxelSize);
+            v1.sub(this.bbox.min).multiplyScalar(invVoxelSize);
+            v2.sub(this.bbox.min).multiplyScalar(invVoxelSize);
+
             // Triangle AABB in world space
             triBox.setFromPoints([v0, v1, v2]);
             // Expand slightly to be conservative
-            triBox.expandByScalar(this.voxelSize * 1e-4);
+            triBox.expandByScalar(1e-4);
 
             // Convert to voxel space
-            const vMin = new THREE.Vector3().copy(triBox.min).sub(this.bbox.min).divideScalar(this.voxelSize).floor();
-            const vMax = new THREE.Vector3().copy(triBox.max).sub(this.bbox.min).divideScalar(this.voxelSize).floor();
+            const vMin = new THREE.Vector3().copy(triBox.min).floor();
+            const vMax = new THREE.Vector3().copy(triBox.max).floor();
 
             vMin.clamp(new THREE.Vector3(0,0,0), gridMax);
             vMax.clamp(new THREE.Vector3(0,0,0), gridMax);
@@ -2355,14 +2353,14 @@ export class WorkerVoxelizer {
             e2.subVectors(v0, v2);
             n.crossVectors(e0, new THREE.Vector3().subVectors(v2, v0));
             const nn = n.dot(n);
-            if (nn < 1e-12) continue;
+            if (!(nn > 16 * Number.EPSILON * e0.lengthSq() * e2.lengthSq())) continue;
             absN.set(Math.abs(n.x), Math.abs(n.y), Math.abs(n.z));
-            const half = this.voxelSize * 0.5;
+            const half = 0.5;
 
             for (let z = vMin.z; z <= vMax.z; z++) {
                 for (let y = vMin.y; y <= vMax.y; y++) {
                     for (let x = vMin.x; x <= vMax.x; x++) {
-                        voxelCenter.set(x + 0.5, y + 0.5, z + 0.5).multiplyScalar(this.voxelSize).add(this.bbox.min);
+                        voxelCenter.set(x + 0.5, y + 0.5, z + 0.5);
 
                         tv0.subVectors(v0, voxelCenter);
                         tv1.subVectors(v1, voxelCenter);
@@ -2376,7 +2374,7 @@ export class WorkerVoxelizer {
                         const test = (edge, ax, ay, az) => {
                             axisTmp.set(edge.y*az - edge.z*ay, edge.z*ax - edge.x*az, edge.x*ay - edge.y*ax);
                             const l2 = axisTmp.x*axisTmp.x + axisTmp.y*axisTmp.y + axisTmp.z*axisTmp.z;
-                            if (l2 < 1e-12) return true;
+                            if (l2 === 0) return true;
                             const p0 = axisTmp.dot(tv0), p1 = axisTmp.dot(tv1), p2 = axisTmp.dot(tv2);
                             const mn = Math.min(p0, p1, p2), mx = Math.max(p0, p1, p2);
                             const r  = half * (Math.abs(axisTmp.x) + Math.abs(axisTmp.y) + Math.abs(axisTmp.z));
@@ -2590,9 +2588,7 @@ export class WorkerVoxelizer {
           processVoxelHit(lin, triId);
         }
       } else {
-        for (const [lin, hit] of voxelHits.map.entries()) {
-          processVoxelHit(lin, hit.tri);
-        }
+        voxelHits.forEach((lin, tri) => processVoxelHit(lin, tri));
       }
 
       if (directInstances) {
@@ -2912,8 +2908,11 @@ if (typeof self !== 'undefined') {
                 const voxelSize = event.data.voxelSize ?? maxDim / resolution;
                 if (!Number.isFinite(voxelSize) || voxelSize <= 0) throw new Error('Invalid voxel size');
                 const dims = size.toArray().map(v => Math.max(1, Math.ceil(v / voxelSize)));
+                if(![...modelData.bbox.min,...modelData.bbox.max,...dims].every(Number.isFinite)) {
+                    throw new Error('Source or marker bounds contain invalid coordinates. Rebuild from a valid geographic capture.');
+                }
                 if (dims.some(v => v > 0x7fffffff) || !Number.isSafeInteger(dims[0] * dims[1] * dims[2])) {
-                    throw new Error('Capture exceeds the supported coordinate range. Reduce radius or increase metres per block.');
+                    throw new Error(`Capture grid ${dims.join(' × ')} exceeds the supported coordinate range. Check geographic marker coordinates or increase metres per block.`);
                 }
                 result = await voxelizer.init({ modelData, voxelSize, needGrid, method, renderMode, hitStoreMode,
                     onProgress: event.data.reportProgress ? message => self.postMessage({ status: 'progress', message }) : null });

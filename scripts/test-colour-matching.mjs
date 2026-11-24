@@ -14,10 +14,10 @@ function lab([r, g, b]) {
 }
 const rgb = [[.5, .5, .5], [.51, .5, .5], [.5, .51, .5], [.5, .5, .51]];
 const blocks = rgb.map((value, i) => ({ name: `colour_${i}`, oklab: lab(value) }));
-setExportBlockPalette(blocks, 0, 'fast');
+setExportBlockPalette(blocks, 0, 'fast',1);
 const fast = createExportBlockMatcher({ blockMatching: 'packed' });
 assert.ok(rgb.some((value, i) => fast(...value) !== blocks[i].name), 'Fixture must demonstrate the bin-centre matching error');
-setExportBlockPalette(blocks, 0, 'accurate');
+setExportBlockPalette(blocks, 0, 'accurate',1);
 for (const packed of [false, true]) {
   const match = createExportBlockMatcher(packed ? { blockMatching: 'packed' } : {});
   for (const i of [3, 0, 2, 1, 0, 3]) assert.equal(match(...rgb[i]), blocks[i].name, 'Exact colours in the same coarse bin must each pick their own block');

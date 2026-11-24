@@ -69,15 +69,15 @@ try {
   const beforeTilt = await page.evaluate(() => window.singleSceneViewer.camera.position.toArray());
   await page.locator('#tilt-up-btn').tap();
   assert.notDeepEqual(await page.evaluate(() => window.singleSceneViewer.camera.position.toArray()), beforeTilt);
-  // Rapid rotation changes cancel obsolete work and keep the old mesh
-  // attached until the latest replacement is ready.
+  // Rapid rotation changes cancel obsolete work and release the previous large
+  // preview before allocating its replacement, as required by the memory path.
   await page.evaluate(() => {
     const input = document.querySelector('#single-scene-rot');
     for (const value of ['15', '37']) { input.value = value; input.dispatchEvent(new Event('input')); }
     window.singleOldRetained = !!window.originalSingleMesh.parent;
   });
-  assert.equal(await page.evaluate(() => window.singleOldRetained), true);
-  await page.waitForFunction(() => window.singleSceneViewer.voxelMeshes[0] !== window.originalSingleMesh);
+  assert.equal(await page.evaluate(() => window.singleOldRetained), false);
+  await page.waitForFunction(() => window.singleSceneViewer.voxelSettingsCurrent===true&&!!window.singleSceneViewer.voxelMeshes[0]&&window.singleSceneViewer.voxelMeshes[0] !== window.originalSingleMesh);
   await page.evaluate(() => { window.originalSingleMesh = window.singleSceneViewer.voxelMeshes[0]; });
   report.exports = await page.evaluate(() => Promise.race([(async () => {
     const THREE = await import('/node_modules/.vite/deps/three.js');

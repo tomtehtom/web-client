@@ -8,21 +8,16 @@ export const bitCount = mask => {
 const linear = c => c <= .04045 ? c / 12.92 : ((c + .055) / 1.055) ** 2.4;
 const srgb = c => c <= .0031308 ? c * 12.92 : 1.055 * c ** (1 / 2.4) - .055;
 
-// Geometry has priority over colour. Inexact masks prefer less invented volume
-// when the symmetric occupancy error is tied. Never discard an occupied cell.
-export function bestShapeMasks(source, available) {
-  let best = Infinity, added = Infinity, masks = [];
-  for (const mask of available) {
-    const error = bitCount(source ^ mask), extra = bitCount(mask & ~source);
-    if (error < best || error === best && extra < added) {
-      best = error; added = extra; masks = [mask];
-    } else if (error === best && extra === added) masks.push(mask);
-  }
-  return masks;
+// Only horizontal halves are representable. Round up, never cut away source
+// samples to approximate a vertical wall with a stair.
+export function roundedShapeMask(source, verticalContinuation = false) {
+  if (!source) return 0;
+  if (verticalContinuation || (source & 0x33) && (source & 0xcc)) return 255;
+  return source & 0x33 ? 0x33 : 0xcc;
 }
 
-export function fitHalfBlockGrid(grid, materials, { profile = 'balanced', bias = 0, onProgress = () => {} } = {}) {
-  if (grid.exportMetadata?.shapeSampling !== 2) throw new Error('Rebuild with slab/stair detail enabled before fitting shapes.');
+export function fitHalfBlockGrid(grid, materials, { profile = 'balanced', bias = 0, chromaWeight = 2, onProgress = () => {} } = {}) {
+  if (grid.exportMetadata?.shapeSampling !== 2) throw new Error('Rebuild with slab height detail enabled before fitting shapes.');
   const candidates = new Map();
   const add = (mask, state, lab) => {
     if (!candidates.has(mask)) candidates.set(mask, []);
@@ -30,12 +25,12 @@ export function fitHalfBlockGrid(grid, materials, { profile = 'balanced', bias =
   };
   for (const block of BLOCKS) add(255, block.name, block.oklab);
   for (const material of materials) {
+    if (!material.name.endsWith('_slab')) continue;
     const rgb = material.colours[profile] ?? material.colours.balanced;
     const lab = rgbToOKLab(rgb.r, rgb.g, rgb.b);
-    for (const { mask, state } of material.variants) add(mask, state, lab);
+    for (const { mask, state } of material.variants) if (mask === 0x33 || mask === 0xcc) add(mask, state, lab);
   }
   if (!candidates.has(255) || !materials.length) throw new Error('The Minecraft shape/material palette is unavailable.');
-  const choices = Array.from({ length: 256 }, (_, mask) => bestShapeMasks(mask, candidates.keys()));
   const size = Object.fromEntries(Object.entries(grid.gridSize).map(([key, value]) => [key, Math.ceil(value / 2)]));
   const cells = new Map();
   onProgress('Grouping half-block samples into 2 × 2 × 2 cells…');
@@ -52,15 +47,24 @@ export function fitHalfBlockGrid(grid, materials, { profile = 'balanced', bias =
   let at = 0;
   for (const [index, cell] of cells) {
     const [mask, r, g, b, count] = cell;
+    const y = Math.floor(index / size.x) % size.y;
+    const above = y + 1 < size.y ? cells.get(index + size.x)?.[0] ?? 0 : 0;
+    const below = y > 0 ? cells.get(index - size.x)?.[0] ?? 0 : 0;
+    // Detect a thin upright feature crossing a cell boundary: an upper sample
+    // touches the lower sample directly above (or vice versa) in the same column.
+    const verticalContinuation = Boolean(((mask & 0xcc) >> 2) & (above & 0x33)
+      || (mask & 0x33) & ((below & 0xcc) >> 2));
+    const rounded = roundedShapeMask(mask, verticalContinuation);
+    const shape = candidates.has(rounded) ? rounded : 255;
     const rgb = [srgb(r / count), srgb(g / count), srgb(b / count)];
-    const key = `${mask}:${rgb.join(',')}`;
+    const key = `${shape}:${rgb.join(',')}`;
     let best = cache.get(key);
     if (!best) {
       const q = rgbToOKLab(...rgb); q.L = Math.max(0, Math.min(1, q.L + bias));
       let distance = Infinity;
-      for (const shape of choices[mask]) for (const candidate of candidates.get(shape)) {
+      for (const candidate of candidates.get(shape)) {
         const lab = candidate.lab;
-        const d = (q.L - lab.L) ** 2 + (q.a - lab.a) ** 2 + (q.b - lab.b) ** 2;
+        const d = (q.L - lab.L) ** 2 + chromaWeight*((q.a - lab.a) ** 2 + (q.b - lab.b) ** 2);
         if (d < distance) { distance = d; best = { ...candidate, mask: shape }; }
       }
       if (cache.size >= 65536) cache.clear();
@@ -76,8 +80,8 @@ export function fitHalfBlockGrid(grid, materials, { profile = 'balanced', bias =
     stats.addedSamples += bitCount(best.mask & ~mask); stats.removedSamples += bitCount(mask & ~best.mask);
     if (at % 100000 === 0) onProgress(`Fitting shapes… ${Math.floor(at / cells.size * 100)}%`);
   }
-  onProgress(`Shape fit: ${stats.full} full, ${stats.slab} slabs, ${stats.stairs} stairs; ${stats.exact} exact, ${stats.approximated} approximate cells.`);
+  onProgress(`Shape fit: ${stats.full} full, ${stats.slab} slabs; ${stats.exact} exact, ${stats.approximated} rounded-up cells; no source samples removed.`);
   return { ...grid, gridSize: size, unit: Object.fromEntries(Object.entries(grid.unit).map(([k, v]) => [k, v * 2])),
     colorSpace: 'srgb', sparse: { indices, colors }, fittedStates: { palette, ids },
-    exportMetadata: { ...grid.exportMetadata, shapeFit: stats, shapeSampling: 1, sampleSpacingMetres: grid.exportMetadata.metersPerBlock / 2 } };
+    exportMetadata: { ...grid.exportMetadata, shapeFit: stats, shapePolicy: 'horizontal-slabs-preserve-vertical', shapeSampling: 1, sampleSpacingMetres: grid.exportMetadata.metersPerBlock / 2 } };
 }

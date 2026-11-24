@@ -29,11 +29,11 @@ async function voxelize(scale, alternateDiagonal = false, constant = false, meth
 try {
   for (const method of ['2.5d-scan']) {
     const reference = await voxelize(1, false, false, method);
-    assert.equal(reference.size, 256);
+    assert.equal(reference.size, 256, `${method}: reference coverage`);
     assert.equal(new Set(reference.values()).size, 256);
     for (const scale of [1e-2, 1e-4, 1e-6]) for (const diagonal of [false, true]) {
       const actual = await voxelize(scale, diagonal, false, method);
-      assert.equal(actual.size, reference.size);
+      assert.equal(actual.size, reference.size, `${method}: coverage at scale ${scale}`);
       for (const [index, expected] of reference) {
         assert.ok(actual.has(index));
         for (const shift of [0, 8, 16]) assert.ok(Math.abs(((actual.get(index) >>> shift) & 255) - ((expected >>> shift) & 255)) <= 1,

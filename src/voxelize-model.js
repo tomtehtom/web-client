@@ -19,6 +19,17 @@ function nextFrame() {
 }
 
 const SERIALIZED_MODEL_CACHE = new WeakMap();
+const MAX_SERIALIZED_CACHE_BYTES = 32 * 1024 * 1024;
+
+export function serializedModelTransfers(payload) {
+  const buffers = new Set();
+  for (const mesh of payload.meshes) {
+    for (const attr of Object.values(mesh.geometry.attributes)) buffers.add(attr.array.buffer);
+    if (mesh.geometry.index) buffers.add(mesh.geometry.index.array.buffer);
+  }
+  for (const [, image] of payload.imageDatas) buffers.add(image.data.buffer);
+  return [...buffers];
+}
 
 export function invalidateSerializedModel(model) { SERIALIZED_MODEL_CACHE.delete(model); }
 
@@ -70,11 +81,8 @@ function cloneSerializedModel(template) {
 function textureToPixels(tex) {
   /* DataTexture or compressed → already has .image.data */
   if (tex.image && tex.image.data && tex.image.width && tex.image.height) {
-    return new ImageData(
-      new Uint8ClampedArray(tex.image.data.buffer),
-      tex.image.width,
-      tex.image.height
-    );
+    // Own the transferable copy: detaching it must not detach the source texture.
+    return { data: new Uint8ClampedArray(tex.image.data), width: tex.image.width, height: tex.image.height };
   }
 
   /* HTMLImageElement / HTMLCanvasElement / ImageBitmap ------------- */
@@ -88,7 +96,10 @@ function textureToPixels(tex) {
   try {
     const ctx = canvas.getContext('2d', { willReadFrequently:true });
     ctx.drawImage(img, 0, 0);
-    return ctx.getImageData(0, 0, img.width, img.height);   // Uint8ClampedArray
+    const pixels = ctx.getImageData(0, 0, img.width, img.height);
+    // ImageData has browser-specific structured-clone serialization. A plain
+    // descriptor lets postMessage transfer the pixel buffer without copying it.
+    return { data: pixels.data, width: pixels.width, height: pixels.height };
   } catch {
     return null; // fall back to material color
   }
@@ -97,7 +108,7 @@ function textureToPixels(tex) {
 /* --------------------------------------------------------------- */
 /* 1️⃣  serialise the model                                         */
 /* --------------------------------------------------------------- */
-export function serializeModel(model, { preRotateYDeg = 0, cache = true } = {}) {
+function* serializeModelSteps(model, { preRotateYDeg = 0, cache = true } = {}) {
   const useCache = cache && Math.abs(preRotateYDeg) <= 0.0001;
   if (useCache) {
     const cached = SERIALIZED_MODEL_CACHE.get(model);
@@ -110,8 +121,9 @@ export function serializeModel(model, { preRotateYDeg = 0, cache = true } = {}) 
 
   model.updateWorldMatrix(true, true);
 
-  model.traverse(o => {
-    if (!o.isMesh || !o.geometry || !o.geometry.isBufferGeometry) return;
+  const nodes = [];
+  model.traverse(o => { if (o.isMesh && o.geometry?.isBufferGeometry) nodes.push(o); });
+  for (const o of nodes) {
 
     /* ── materials & textures ───────────────────────────────────── */
     const mats = Array.isArray(o.material) ? o.material : [o.material];
@@ -129,7 +141,7 @@ export function serializeModel(model, { preRotateYDeg = 0, cache = true } = {}) 
         const t = mat[key];
         if (!(t && t.isTexture)) continue;
 
-        const idata = textureToPixels(t);
+        const idata = imageStore.get(t.source.uuid) ?? textureToPixels(t);
         if (idata) {
           if (!imageStore.has(t.source.uuid)) imageStore.set(t.source.uuid, idata);
 
@@ -173,7 +185,8 @@ export function serializeModel(model, { preRotateYDeg = 0, cache = true } = {}) 
       materials   : mats.map(m => m.uuid),
       matrixWorld : o.matrixWorld.toArray()
     });
-  });
+    yield { completed: meshes.length, total: nodes.length };
+  }
 
   const bbox = new THREE.Box3().setFromObject(model);
 
@@ -214,12 +227,48 @@ export function serializeModel(model, { preRotateYDeg = 0, cache = true } = {}) 
     bbox       : { min: bbox.min.toArray(), max: bbox.max.toArray() }
   };
 
-  if (useCache) {
+  if (model.userData.voxelGridBlockSize != null) {
+    const snap = model.userData.voxelGridBlockSize;
+    if(!Number.isFinite(snap)||snap<=0)throw new Error('Invalid geographic block size');
+    // Full-block boundaries keep half-block sample pairs on the same lattice.
+    for (const axis of [0,1,2]) {
+      serialized.bbox.min[axis]=Math.floor(serialized.bbox.min[axis]/snap+1e-8)*snap;
+      serialized.bbox.max[axis]=Math.ceil(serialized.bbox.max[axis]/snap-1e-8)*snap;
+    }
+  }
+
+  if (useCache && serializedModelTransfers(serialized).reduce((sum, buffer) => sum + buffer.byteLength, 0) <= MAX_SERIALIZED_CACHE_BYTES) {
     SERIALIZED_MODEL_CACHE.set(model, serialized);
     return cloneSerializedModel(serialized);
   }
 
   return serialized;
+}
+
+export function serializeModel(model, options = {}) {
+  const steps = serializeModelSteps(model, options);
+  let step;
+  do { step = steps.next(); } while (!step.done);
+  return step.value;
+}
+
+export async function serializeModelAsync(model, { onProgress, signal, budgetMs = 8, ...options } = {}) {
+  const steps = serializeModelSteps(model, options);
+  let deadline = nowMs() + budgetMs, lastReport = -Infinity;
+  while (true) {
+    signal?.throwIfAborted();
+    const step = steps.next();
+    if (step.done) return step.value;
+    const now = nowMs();
+    if (now >= deadline) {
+      if (now - lastReport >= 750) {
+        onProgress?.(`Serializing sources: ${step.value.completed.toLocaleString()}/${step.value.total.toLocaleString()} meshes`);
+        lastReport = now;
+      }
+      await new Promise(resolve => setTimeout(resolve, 0));
+      deadline = nowMs() + budgetMs;
+    }
+  }
 }
 
 /* --------------------------------------------------------------- */
@@ -547,6 +596,9 @@ function attachSharedWebGpuWorkerHandlers(pool, slot) {
     slot.current = null;
     slot.busy = false;
     if (!job) return;
+    // Full-scene jobs retain large baked geometry/texture heaps. Destroy their
+    // worker after result transfer; small per-tile jobs still reuse warm workers.
+    if (job.releaseWorker) resetSharedWebGpuWorkerSlot(pool, slot);
 
     const workerCompletedAt = nowMs();
     const { status, result, message, stack } = e.data;
@@ -647,7 +699,13 @@ function pumpSharedWebGpuWorkerQueue() {
       }
       job.onProgress?.('Worker started; preparing geometry…');
       slot.worker.postMessage(job.payload, job.transfers);
+      // Controllers remain reachable from the viewer after completion. They
+      // must not retain the job's source descriptors (or detached buffer views).
+      job.payload = null;
+      job.transfers = null;
     } catch (error) {
+      job.payload = null;
+      job.transfers = null;
       resetSharedWebGpuWorkerSlot(pool, slot);
       job.reject(error);
     }
@@ -660,7 +718,7 @@ function enqueueSharedWebGpuWorkerJob({ payload, transfers, onStart, onProgress,
     const job = {
       payload,
       transfers,
-      onStart,
+      releaseWorker: Boolean(payload.needGrid),
       onProgress,
       serializeStartedAt,
       mainThreadPolicy,
@@ -704,15 +762,14 @@ async function voxelizeModelWithWorker({ model, serializedModel = null, resoluti
   if (onProgress) { onProgress('Serializing model geometry and textures…'); await nextFrame(); }
   return new Promise((resolve, reject) => {
     const serializeStartedAt = nowMs();
-    const payload = serializedModel ?? serializeModel(model, { preRotateYDeg });
+    const serialization = new AbortController();
+    onStart?.({ terminate: () => serialization.abort(new Error('Voxelization cancelled')) });
+    const prepare = serializedModel ? Promise.resolve(serializedModel) : serializeModelAsync(model, { preRotateYDeg, onProgress, signal: serialization.signal });
+    prepare.then(payload => {
+    serialization.signal.throwIfAborted();
 
-    /* collect ArrayBuffers for zero-copy transfer */
-    const transfers = [];
-    payload.meshes.forEach(m => {
-      Object.values(m.geometry.attributes).forEach(a => transfers.push(a.array.buffer));
-      if (m.geometry.index) transfers.push(m.geometry.index.array.buffer);
-    });
-    payload.imageDatas.forEach(([uuid, idata]) => transfers.push(idata.data.buffer));
+    const transfers = serializedModelTransfers(payload);
+    onProgress?.(`Transferring source: ${payload.meshes.length.toLocaleString()} meshes, ${payload.imageDatas.length.toLocaleString()} textures, ${(transfers.reduce((sum, buffer) => sum + buffer.byteLength, 0) / 1048576).toFixed(1)} MiB of buffers (ownership transfer).`);
 
     // Reuse workers for JS/WASM as well as WebGPU: repeated LOD builds keep
     // their module/JIT/WASM startup warm and share one cancellable queue.
@@ -724,12 +781,13 @@ async function voxelizeModelWithWorker({ model, serializedModel = null, resoluti
         serializeStartedAt,
         mainThreadPolicy,
     }).then(resolve, reject);
+    }).catch(reject);
   });
 }
 
 async function voxelizeModelWithWebGpu({ model, renderer, resolution = 200, voxelSize = null, needGrid = false, method = 'webgpu', renderMode = 'mesh', onStart, onProgress, preRotateYDeg = 0, mainThreadPolicy = null }) {
   if (onProgress) { onProgress('Serializing model geometry and textures…'); await nextFrame(); }
-  const serializedModel = serializeModel(model, { preRotateYDeg });
+  const serializedModel = await serializeModelAsync(model, { preRotateYDeg, onProgress });
   const { useWebGpu, analysis } = shouldUseWebGpuForSerializedModel(serializedModel, resolution);
   const dispatchMethod = useWebGpu ? 'webgpu' : '2.5d-scan';
   const dispatchRenderMode = renderMode;

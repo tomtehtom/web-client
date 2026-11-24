@@ -5,21 +5,27 @@ const srgbBytes = Float64Array.from(linearBytes, x => x <= 0.04045 ? x / 12.92 :
 
 export function createVoxelTextureSampler({ data, width, height }, tex, srgb) {
   const table = srgb ? srgbBytes : linearBytes;
-  const { offset, repeat, rotation, center, flipY, wrapS, wrapT } = tex;
+  const { offset={x:0,y:0}, repeat={x:1,y:1}, rotation=0, center={x:0,y:0}, flipY, wrapS, wrapT } = tex;
   const cos = Math.cos(rotation), sin = Math.sin(rotation);
   const out = [0, 0, 0, 0]; // Borrowed until the next call; consumers use it immediately.
-  const wrap = (value, mode) => mode === 1000 ? ((value % 1) + 1) % 1 : Math.min(1, Math.max(0, value));
+  const wrap = (value, mode) => {
+    if(mode===1000)return ((value%1)+1)%1;
+    if(mode===1002){const v=((value%2)+2)%2;return v>1?2-v:v;}
+    return Math.min(1,Math.max(0,value));
+  };
+  const address=(index,size,mode)=>mode===1000?((index%size)+size)%size:Math.min(size-1,Math.max(0,index));
+  // Same transform as THREE.Matrix3.setUvTransform, including scaled centres.
+  const m00=repeat.x*cos,m01=repeat.x*sin,m02=-repeat.x*(cos*center.x+sin*center.y)+center.x+offset.x;
+  const m10=-repeat.y*sin,m11=repeat.y*cos,m12=-repeat.y*(-sin*center.x+cos*center.y)+center.y+offset.y;
   const sample = uv => {
-    let u = uv.x * repeat.x + offset.x, v = uv.y * repeat.y + offset.y;
-    if (rotation !== 0) {
-      u -= center.x; v -= center.y;
-      const x = u * cos - v * sin;
-      v = u * sin + v * cos + center.y; u = x + center.x;
-    }
+    let u = m00*uv.x+m01*uv.y+m02,v=m10*uv.x+m11*uv.y+m12;
     u = wrap(u, wrapS); v = wrap(v, wrapT); if (flipY) v = 1 - v;
-    const x = u * (width - 1), y = v * (height - 1);
-    const x0 = Math.floor(x), y0 = Math.floor(y), x1 = Math.min(width - 1, x0 + 1), y1 = Math.min(height - 1, y0 + 1);
-    const tx = x - x0, ty = y - y0;
+    // Normalized UVs address texel centres at (i+.5)/size, exactly like WebGL.
+    // Multiplying by size-1 shifts atlas-chart borders into adjacent imagery.
+    const x = u * width - .5, y = v * height - .5;
+    const ix=Math.floor(x),iy=Math.floor(y),tx=x-ix,ty=y-iy;
+    const x0=address(ix,width,wrapS),x1=address(ix+1,width,wrapS);
+    const y0=address(iy,height,wrapT),y1=address(iy+1,height,wrapT);
     const i0 = (y0 * width + x0) * 4, i1 = (y0 * width + x1) * 4;
     const i2 = (y1 * width + x0) * 4, i3 = (y1 * width + x1) * 4;
     const w0 = (1 - tx) * (1 - ty), w1 = tx * (1 - ty), w2 = (1 - tx) * ty, w3 = tx * ty;

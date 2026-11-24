@@ -1,5 +1,5 @@
 import * as THREE from 'three';
-import { BLOCKS, initBlockData, getMinecraftBrightnessBias, getSharedAtlasTexture, getBlockMatchingMode, getBlockPaletteKey, getBlockColourProfile } from './assignToBlocksForGLB.js';
+import { BLOCKS, initBlockData, getMinecraftBrightnessBias, getSharedAtlasTexture, getBlockMatchingMode, getBlockPaletteKey, getBlockColourProfile, getBlockChromaWeight } from './assignToBlocksForGLB.js';
 
 let shapeMaterials;
 async function loadShapeMaterials() {
@@ -26,8 +26,9 @@ export class VoxelExportSession {
       payload.palette = BLOCKS.map(({ name, oklab, uv, faceUvs }) => ({ name, oklab, uv, faceUvs }));
       payload.bias = getMinecraftBrightnessBias();
       payload.matchingMode = getBlockMatchingMode();
+      payload.chromaWeight = getBlockChromaWeight();
     }
-    if (shapes) { payload.shapes = shapes; payload.profile = getBlockColourProfile(); payload.bias = getMinecraftBrightnessBias(); }
+    if (shapes) { payload.shapes = shapes; payload.profile = getBlockColourProfile(); payload.bias = getMinecraftBrightnessBias(); payload.chromaWeight=getBlockChromaWeight(); }
     return new Promise((resolve, reject) => {
       this.pending = reject;
       this.worker.onmessage = ({ data }) => {
@@ -59,6 +60,9 @@ export async function makeExportGroup(surface) {
     const byName = new Map(BLOCKS.map(block => [block.name, block]));
     for (let index = 0; index < surface.palette.length; index++) {
       const block = byName.get(surface.palette[index]);
+      if (!block && surface.palette[index] === 'red_concrete') {
+        materials.push(new THREE.MeshBasicMaterial({ color: 0xff0000 })); continue;
+      }
       const rect = block.faceUvs?.[surface.materialFaces?.[index]] ?? block.uv;
       const canvas = document.createElement('canvas'); canvas.width = canvas.height = 16;
       // The shared preview atlas has flipY=false: its UV rows follow image rows.

@@ -1,8 +1,157 @@
 # Local Minecraft editor
 
-## Half-block slab/stair detail
+## Colour priority
 
-In Single Scene, enable **Slab/stair detail (2 × 2 × 2 samples per block)** under
+**Preserve hue** is the default colour priority. Matching uses
+`deltaL² + 2 × (deltaA² + deltaB²)` in OKLab, giving chromatic differences more
+weight than brightness differences. The former plain OKLab distance could choose
+pink wool for warm muted colours such as sRGB (210,140,120), even with terracotta
+enabled. Hue priority selects white terracotta for that sample without preventing
+exact pink source colours from selecting pink blocks. **Balanced** restores the
+original equal-weight OKLab metric. Neither mode assigns a material by object type.
+
+The selected priority is saved and used by the Accurate shader, Fast lookup,
+full-block exports and slab material matching. Changing it updates matching while
+retaining voxel geometry; source tiles do not need refetching. A brighter/darker
+block can win when its colour is closer. This is a matching preference rather than
+a change to the vanilla texture reference colours.
+
+## Geographic alignment markers
+
+Enable **Red geographic alignment markers (~250 m grid)** under Minecraft scale.
+The capture request's latitude, longitude and radius select points from a fixed
+worldwide geodetic lattice; the lattice is never restarted at the scan origin.
+Latitude rows have fixed angular spacing, with a fixed number of longitude columns
+per row to keep ground spacing approximately 250 metres. This is not an exact
+250-metre square projection of the curved Earth. IDs and WGS84 coordinates remain
+identical across overlapping requests, including across the date line.
+
+Markers appear inside the requested geographic radius as full red concrete blocks,
+including in slab mode and when red concrete is disabled in the colour palette.
+They replace geometry at their block positions. Preview, combined/tiled schematics,
+Structure NBT and function exports include them. The marker layer defaults to
+**25 full blocks below the scan's lowest source geometry**, snapped to the full-block
+lattice. Change **Marker depth below scan minimum (blocks)** to adjust it. Slab
+sampling does not halve this depth or turn the markers into slabs. Markers are
+normally hidden beneath terrain in the editor. Markers are real cube geometry in
+the voxelization input and produce occupied voxels in the worker output. The old
+screen-square overlay has been removed. Orbit below the terrain to inspect cubes.
+Use **Frame markers** to fit the entire voxel terrain and underground marker layer
+in view. The button becomes **Restore previous view**; click it again to restore
+the prior camera position, target and clipping range. This is a camera toggle and
+does not hide the voxel mesh. The status line shows
+the generated block count or explains that no grid intersections were found. Model
+bounds do not filter the points; export bounds expand to include all requested
+markers even with partial downloaded geometry. Invalid/non-Earth coordinate frames
+or a capture location far from the loaded scene disable markers with an explicit
+status message; terrain voxelization still continues, including slab mode. Marker
+errors are also recorded in export metadata. Single Scene detects conventional
+ECEF and glTF up-axis conventions by comparing the decoded scene centre with the
+request's WGS84 location, then applies one consistent frame to terrain and markers.
+Bounds are derived from
+the combined terrain/cube geometry and snapped to full-block spacing.
+The layer extends export height downwards. Marker heights are scan-relative, so
+captures with different minima need terrain-based vertical alignment even though
+their geographic marker IDs and horizontal locations match.
+Changing the controls rebuilds already-loaded geometry without refetching tiles.
+
+Export metadata records marker IDs, exact geographic coordinates, depth and
+grid-relative block positions. Combined schematic metadata also records the crop
+offset, so a marker's schematic coordinate is its grid coordinate minus that offset.
+Use the same metres per block and rotation for captures you want to paste together.
+Fixed geographic reference points do not guarantee identical voxel seams between
+arbitrary captures: the editor still uses a capture-local tangent frame, and final
+block rounding can differ by a block when scan centres change. Differently rotated
+exports require rotation as well as translation. The markers provide common
+geographic reference points, not a global voxel projection for the whole Earth.
+
+## Capture speed and estimated time
+
+Tileset discovery runs up to 24 JSON requests concurrently on desktop (6 on
+coarse-pointer/mobile devices). Model download/decoding uses 16 desktop lanes with
+texture memory saving, or 8 with original textures; mobile stays at 3. Capture
+radius, geometric detail and selected models are unchanged.
+
+**Source texture memory** defaults to a 128px maximum image edge. Images are
+resized as models finish loading, before they accumulate. This reduces texture
+colour detail, not geometry or metric spacing. Choose 256px, 512px or Original for
+more colour detail at higher memory cost; refetch to apply. For example, a
+1024px-square RGBA image becomes 128px-square, using 1/64 of the uncompressed
+pixel memory. Compressed/DataTexture sources are left intact.
+
+Progress logs show requests/models per second and a phase-specific ETA based on
+recent completions (roughly the last 15 seconds). Discovery estimates cover the
+currently known active/queued tileset requests and may increase as new branches
+are found. Download/decode estimates use the known model count. Startup or stalled
+phases show `estimating…` when there is insufficient throughput to calculate an
+estimate. These are not promises of total capture time: stitching and voxelization
+follow model loading. Actual speed depends on server and connection capacity.
+
+## Rebuild memory
+
+Scan and 3D SAT sample texture atlases at WebGL texel centres (`uv * size - 0.5`),
+with the same UV transform as Three.js and proper clamp/repeat/mirror addressing.
+The previous `uv * (size - 1)` mapping shifted samples into neighbouring atlas
+charts, producing pale top/left borders and L-shaped streaks (especially with
+reduced-resolution source textures). A sand/water atlas regression covers internal
+chart edges; a browser test compares 192 opaque samples against actual WebGL
+sampling across transforms, flipY, colour spaces and wrapping modes. Rebuild the
+voxel preview to regenerate colours; source tiles need not be refetched for this
+sampling-coordinate correction.
+
+Single-image source atlases whose UVs stay within 0..1 and have no explicit texture
+repeat/offset/rotation use clamp-to-edge sampling. This prevents a closest-point
+sample at UV=1 from wrapping to the opposite side of an imagery tile and producing
+colour grid lines after rotation. Meshes with repeating UVs or texture transforms
+retain their wrapping. The protection runs during loading and again on rebuilds,
+so existing loaded captures do not need a refetch for this correction. Source
+imagery can still contain real colour/exposure differences between tiles.
+
+Large captures store voxel hits in adaptive typed-array pages. The page directory
+contains one entry per group of 1,024 potential linear voxel positions, rather
+than a JavaScript Map entry/object for every occupied voxel. This removes the
+single-Map entry ceiling that caused `Map maximum size exceeded` near 16.8 million
+occupied voxels. Sparse pages start small and promote to dense storage when that
+uses less memory; hit distances retain double precision. The regression exceeds
+the former entry ceiling with 16,778,241 occupied hits using about 192 MiB of typed
+buffers (excluding page-directory overhead). Overall scene/colour/preview memory
+limits still apply.
+
+3D SAT intersection tests run in voxel coordinates, with a relative degeneracy
+test. A previous fixed threshold in normalized viewer coordinates discarded
+valid small triangles in kilometre-scale captures, leaving scattered ground,
+roof and wall holes. Rebuild the voxels after updating to regenerate those cells;
+this is independent of the texture-memory setting. The coverage regression checks
+normalization scales down to 1e-6, all three plane orientations, multiple source
+tessellations, and dense/sparse occupancy stores.
+
+The source scene stays hidden until source view is selected, preventing a transient
+upload of thousands of source textures immediately before voxelization. Layer 0
+is disabled during rebuilds. The unbounded Three.js JS cache of compressed files
+and decoded images is disabled; browser HTTP caching remains available.
+Completed models also discard their GLTF parser, releasing intermediate compressed
+buffers and dependency caches while retaining the finished scene and metadata.
+Serialization yields between meshes with an 8ms work budget and reports progress,
+so texture extraction no longer runs as one long main-thread loop. Serialization
+can be cancelled when a new rebuild supersedes it. A single very large mesh/image
+operation can still exceed that budget.
+
+Changing rotation or resolution releases the previous Single Scene voxel preview,
+export grid and export worker before starting a replacement. Downloaded source
+tiles remain loaded. If the rebuild fails, rebuild again from those tiles; the
+previous voxel result is no longer available.
+
+Worker textures use plain RGBA descriptors and transferable buffers rather than
+browser `ImageData` structured cloning. Shared texture sources are read once per
+serialization. Payloads over 32 MiB bypass the extra serialization cache; source
+data is dropped from completed job descriptors, and full-scene voxel workers are
+terminated after returning their results to release their large heaps. Small map
+tile jobs still use warm pooled workers. Logs report mesh/texture counts and the
+MiB of buffers transferred, to distinguish transfer pressure from rasterization.
+
+## Half-block slab height detail
+
+In Single Scene, enable **Slab height detail (2 × 2 × 2 samples per block)** under
 Minecraft scale. Leave **Metres per block = 1** for life size. This samples the
 source at 0.5 m while exporting one Minecraft block per metre. Rotation is applied
 before sampling. Changing the checkbox rebuilds existing loaded geometry; source
@@ -12,32 +161,32 @@ more memory and processing than the normal full-block mode.
 
 The preview and GLB show the fine voxel samples, not the fitted block shapes.
 Modern Minecraft exports (`.schem`, tiled `.schem` ZIP, `.nbt`, and `.mcfunction`)
-group samples back into 2 × 2 × 2 cells and fit full cubes, top/bottom slabs, or
-stairs with facing/half/inner/outer states. Legacy MCEdit export is rejected in
+group samples back into 2 × 2 × 2 cells and fit full cubes or top/bottom slabs.
+Stairs are no longer used. Legacy MCEdit export is rejected in
 this mode because it cannot preserve modern states.
 
 The generated `public/minecraft-shapes.json` contains **198 materials and 4,082
-states**, baked from vanilla 26.3 block models. Slab/stair matching considers all
-these materials; full cubes use your current palette. This allows coloured voxel
-surfaces to use the closest available stair/slab material even when the full-block
+states**, baked from vanilla 26.3 block models. Height matching uses only its
+101 slab materials; full cubes use your current palette. This allows coloured voxel
+surfaces to use the closest available slab material even when the full-block
 palette contains only wool/concrete/terracotta, which have no equivalent shapes.
 Colour profiles and brightness bias apply to matching. Waterlogging is disabled.
 
-An occupied sample is one bit in an eight-bit mask. Full cubes contain eight,
-slabs four, straight stairs six, inner stairs seven, and outer stairs five.
-Exact masks win before colour is considered. For other masks, the fitter minimises
-added plus missing occupied samples, then prefers less added volume on ties, then
-compares average source colour in OKLab. It does not discard entire occupied cells
-or insert arbitrary single-block air to improve a score. Shape-fit counts and
-added/missing samples are saved in export metadata; progress logs show exact vs
-approximate counts. Thin/sparse surfaces therefore remain approximations where
-Minecraft has no matching geometry.
+An occupied sample is one bit in an eight-bit mask. Samples confined to a single
+horizontal half become a top or bottom slab, including single-sample fragments.
+Samples spanning both height layers become a full cube, preserving thin vertical
+walls and poles. Touching samples directly above/below across metre-cell boundaries
+also become full cubes so upright features crossing those boundaries stay upright.
+Every source sample is contained in the output shape: rounding adds volume and
+never removes occupied samples. Shape choice precedes OKLab colour matching.
+Shape-fit counts and added/missing samples are saved in export metadata; progress
+logs show exact vs rounded-up cells. The metadata records the
+`horizontal-slabs-preserve-vertical` policy.
 
-The automated tests check all 255 nonempty masks, an independent direction/half
-oracle, colour choices, metric grouping, and parsed NBT/schematic properties.
-Browser tests verify the UI, worker and export paths. In-game pasting and neighbour
-updates have not been verified: Minecraft can recalculate stair corner states when
-surrounding blocks change, so test a small export in your world first.
+The automated tests check all 255 nonempty masks, zero removed samples, thin walls,
+single fragments, poles across cell boundaries, colour choices, metric grouping,
+and parsed NBT/schematic properties. Browser tests verify the UI, worker and export
+paths. In-game pasting has not been verified; test a small export first.
 
 ## Minecraft 26.3 palette
 

@@ -41,6 +41,7 @@ uniform sampler2D paletteLab;
 uniform sampler2D paletteRects;
 uniform int paletteCount;
 uniform float brightnessBias;
+uniform float chromaWeight;
 flat in uint facePayload;
 flat in uint faceTextured;
 flat in uvec2 faceSize;
@@ -72,7 +73,7 @@ void main() {
       int best = 0;
       for (int i = 0; i < paletteCount; i++) {
         vec3 delta = lab - texelFetch(paletteLab, ivec2(i, 0), 0).rgb;
-        float distanceSquared = dot(delta, delta);
+        float distanceSquared = delta.x*delta.x+chromaWeight*dot(delta.yz,delta.yz);
         if (distanceSquared < bestDistance) { bestDistance = distanceSquared; best = i; }
       }
       rect = texelFetch(paletteRects, ivec2(best, int(faceDirection)), 0);
@@ -125,7 +126,7 @@ export function createPackedVoxelMesh(chunk) {
     glslVersion: THREE.GLSL3, vertexShader, fragmentShader,
     defines: chunk.chunkOffsets ? { BATCHED_CHUNKS: 1 } : {},
     uniforms: { voxelColors: { value: texture }, blockTextured: { value: false }, blockRects: { value: null }, blockAtlas: { value: null },
-      accurateMatching: { value: false }, paletteLab: { value: null }, paletteRects: { value: null }, paletteCount: { value: 0 }, brightnessBias: { value: 0 } }, toneMapped: false,
+      accurateMatching: { value: false }, paletteLab: { value: null }, paletteRects: { value: null }, paletteCount: { value: 0 }, brightnessBias: { value: 0 }, chromaWeight: { value: 2 } }, toneMapped: false,
   });
   // Texture is private to this chunk; all existing tile cleanup paths dispose materials.
   material.addEventListener('dispose', () => texture?.dispose());
@@ -152,6 +153,7 @@ export function setPackedVoxelTextures(root, resources, enabled) {
     uniforms.paletteRects.value = resources?.paletteRects ?? null;
     uniforms.paletteCount.value = resources?.paletteCount ?? 0;
     uniforms.brightnessBias.value = resources?.bias ?? 0;
+    uniforms.chromaWeight.value = resources?.chromaWeight ?? 2;
   });
   root.userData.__mcApplied = active;
 }

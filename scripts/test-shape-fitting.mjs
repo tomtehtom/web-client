@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import nbt from 'prismarine-nbt';
-import { bitCount, bestShapeMasks, fitHalfBlockGrid } from '../src/shape-fitting.js';
+import { bitCount, roundedShapeMask, fitHalfBlockGrid } from '../src/shape-fitting.js';
 import { setExportBlockPalette, rgbToOKLab, buildBlockGrid } from '../src/assignToBlocksForGLB.js';
 import { writeCombinedSchematic } from '../src/combined-schematic.js';
 import { writeStructureGrid } from '../src/structure-export.js';
@@ -51,18 +51,29 @@ assert.equal(fitted.unit.x, 1); assert.equal(fitted.gridSize.y, 1);
 assert.equal(fitted.exportMetadata.metersPerBlock, 1);
 const states = new Map(materials.flatMap(m=>m.variants.map(v=>[v.state,v.mask])));
 states.set('stone',255);
-const available = [...new Set(states.values())];
 for (let i=0;i<masks.length;i++) {
   const state = fitted.fittedStates.palette[fitted.fittedStates.ids[i]];
-  const actual = states.get(state), error = bitCount(actual ^ masks[i]);
-  assert.equal(error, Math.min(...available.map(mask=>bitCount(mask ^ masks[i]))));
-  if (available.includes(masks[i])) assert.equal(actual,masks[i], 'Every representable orientation must be exact');
-  assert.ok(bestShapeMasks(masks[i],available).includes(actual));
+  const actual = states.get(state);
+  const bottom = masks[i] & 0x33, top = masks[i] & 0xcc;
+  assert.equal(actual, bottom && top ? 255 : bottom ? 0x33 : 0xcc);
+  assert.equal(actual & masks[i],masks[i], 'Rounding must preserve every source sample');
+  assert.ok(!state.includes('_stairs['));
 }
+assert.equal(fitted.exportMetadata.shapeFit.removedSamples,0);
+assert.equal(roundedShapeMask(0),0);
+for (let bit=0;bit<8;bit++) assert.equal(bitCount(roundedShapeMask(1<<bit)),4,'Isolated sub-slab fragments round up to a slab');
+for (const wall of [0x55,0xaa,0x0f,0xf0,0x05,0x0a,0x50,0xa0]) assert.equal(roundedShapeMask(wall),255,'Thin vertical walls/poles round up to full blocks');
+// Two touching half-samples straddling a metre-cell boundary form a vertical pole.
+const pole = source([1]);
+pole.gridSize={x:2,y:4,z:2};
+pole.sparse={indices:new Float64Array([2,4]),colors:new Uint32Array(2).fill(0xff808080)};
+const fittedPole=fitHalfBlockGrid(pole,materials);
+assert.equal(fittedPole.sparse.indices.length,2);
+assert.ok([...fittedPole.fittedStates.ids].every(id=>fittedPole.fittedStates.palette[id]==='stone'));
 // Same geometry, distinctly different colours must select the matching material.
 const testMaterials = [
-  {...slab, name:'black',colours:{balanced:{r:0,g:0,b:0}},variants:[{mask:51,state:'blackstone_slab[type=bottom,waterlogged=false]'}]},
-  {...slab, name:'white',colours:{balanced:{r:1,g:1,b:1}},variants:[{mask:51,state:'quartz_slab[type=bottom,waterlogged=false]'}]},
+  {...slab, name:'blackstone_slab',colours:{balanced:{r:0,g:0,b:0}},variants:[{mask:51,state:'blackstone_slab[type=bottom,waterlogged=false]'}]},
+  {...slab, name:'quartz_slab',colours:{balanced:{r:1,g:1,b:1}},variants:[{mask:51,state:'quartz_slab[type=bottom,waterlogged=false]'}]},
 ];
 for (const [packed, expected] of [[0xff000000,'blackstone'],[0xffffffff,'quartz']]) {
   const grid = source([51]); grid.sparse.colors.fill(packed);
@@ -74,7 +85,7 @@ assert.equal(schematic.DataVersion,MINECRAFT_DATA_VERSION);
 assert.equal(schematic.Height,1);
 for (const state of fitted.fittedStates.palette) assert.ok(`minecraft:${state}` in schematic.Palette);
 const structure = nbt.simplify((await nbt.parse(Buffer.from(await writeStructureGrid(buildBlockGrid(fitted))))).parsed);
-assert.ok(structure.palette.some(entry=>entry.Properties?.half === 'top'));
+assert.ok(structure.palette.some(entry=>entry.Properties?.type === 'top'));
 assert.ok(structure.palette.some(entry=>entry.Properties?.type === 'bottom'));
 assert.ok(structure.palette.every(entry=>!entry.Name.includes('[')));
 for (const bucket of partitionSparseGrid(fitted).values()) {
@@ -82,4 +93,4 @@ for (const bucket of partitionSparseGrid(fitted).values()) {
   assert.ok(tile.palette.every(state=>fitted.fittedStates.palette.includes(state)));
 }
 assert.throws(()=>fitHalfBlockGrid({...original,exportMetadata:{}},materials),/Rebuild/);
-console.log(`Shape fitting: ${materials.length} materials, 4,082 states; all 255 occupancy masks, independent stair orientation, colour choices, metric scale, stateful NBT/schematic and tile partitions passed.`);
+console.log('Shape fitting: all 255 masks preserve every occupied sample; horizontal slabs, single fragments, thin walls/poles across cell boundaries, colour choices, scale and stateful exports passed.');

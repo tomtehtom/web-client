@@ -748,6 +748,14 @@
                 <span>Low detail</span>
               </div>
               <label class="flex items-center gap-2 text-xs mt-2"><input id="single-scene-max-detail" type="checkbox">Highest available source detail</label>
+              <label for="single-scene-texture-limit" class="block text-xs mt-2">Source texture memory (refetch to apply)</label>
+              <select id="single-scene-texture-limit" class="w-full bg-white/10 rounded-lg px-2 py-1 text-xs">
+                <option value="128" selected>128px — memory saver for large captures</option>
+                <option value="256">256px — more texture detail</option>
+                <option value="512">512px — high memory use</option>
+                <option value="0">Original textures — highest memory use</option>
+              </select>
+              <p class="text-xs opacity-60 mt-1">Limits texture image size, not geometry or metres per block. Reduces colour detail to keep large captures within memory.</p>
               <p class="text-xs opacity-60 mt-1">Lower values fetch finer geometry and more tiles. Start at 1 m for 1 m blocks. Refetch to apply. This is geometric error, not camera pixel SSE.</p>
             </div>
 
@@ -797,9 +805,16 @@
               <input id="single-scene-meters-per-block" type="number" min="0.1" max="100" step="0.1" value="1"
                 class="w-full rounded-lg bg-white/10 px-2 py-1 text-xs outline-none mt-1" />
               <p class="text-xs opacity-60 mt-1 mb-2">1 = life size. Rotation is applied before making blocks. At 0°, east is +X and north is −Z.</p>
-              <label class="flex items-center gap-2 text-xs mt-2"><input id="single-scene-shape-detail" type="checkbox">Slab/stair detail (2 × 2 × 2 samples per block)</label>
-              <p class="text-xs opacity-60 mt-1 mb-2">Half-block sample preview; Minecraft exports fit full blocks, top/bottom slabs and oriented stairs. Uses all vanilla slab/stair materials plus your full-block palette. Eight times the volume samples. Requires exact metric scale; rebuild to apply.</p>
+              <label class="flex items-center gap-2 text-xs mt-2"><input id="single-scene-shape-detail" type="checkbox">Slab height detail (2 × 2 × 2 samples per block)</label>
+              <p class="text-xs opacity-60 mt-1 mb-2">Horizontal surfaces use top/bottom slabs. Vertical walls and thin upright poles become full blocks; smaller fragments round up to at least a slab. No occupied samples are removed. Uses all vanilla slab materials plus your full-block palette. Preview shows half-block samples. Eight times the volume samples; exact metric scale only. Rebuild to apply.</p>
               <p id="single-scene-scale-summary" class="text-xs text-emerald-200 mb-2" aria-live="polite">1 block = 1 metre</p>
+              <label class="flex items-center gap-2 text-xs mt-2"><input id="single-scene-geo-markers" type="checkbox">Red geographic alignment markers (~250 m grid)</label>
+              <button id="single-scene-frame-markers" type="button" class="rounded bg-white/10 px-2 py-1 text-xs mt-1">Frame markers</button>
+              <p id="single-scene-marker-status" class="text-xs text-red-200 mt-1" aria-live="polite">Enable geographic markers and rebuild to generate them.</p>
+              <label class="block text-xs mt-1">Marker depth below scan minimum (blocks)
+                <input id="single-scene-marker-height" type="number" min="0" max="1000" step="1" value="25" class="w-20 bg-white/10 rounded px-2 py-1">
+              </label>
+              <p class="text-xs opacity-60 mt-1 mb-2">Fixed global latitude/longitude points; full red concrete blocks in preview and exports, including slab mode. Markers sit on one layer below the lowest source geometry, usually hidden underground. Different scan minima change marker height; use several markers to align horizontally. Keep rotation and metres per block consistent.</p>
               <button id="single-scene-rebuild" class="w-full bg-white/10 rounded-lg px-2 py-2 text-xs mb-2">Rebuild voxel preview</button>
               <div id="single-scene-density-controls" class="hidden">
               <label class="block text-sm font-medium text-white/80 mb-2">Voxel Density</label>
@@ -841,10 +856,16 @@
           </div>
           <label for="single-scene-colour-matching" class="block">Colour matching</label>
           <select id="single-scene-colour-matching" class="w-full bg-white/10 rounded-lg px-2 py-2">
-            <option value="accurate" selected>Accurate — nearest OKLab colour</option>
+            <option value="accurate" selected>Accurate — nearest colour for selected priority</option>
             <option value="fast">Fast — approximate colour bins</option>
           </select>
           <p class="opacity-60">Accurate compares the voxel colour with every enabled block's average texture colour. Fast improves preview speed but can pick a less similar block. Changing this updates matching without refetching.</p>
+          <label for="single-scene-colour-priority" class="block">Colour priority</label>
+          <select id="single-scene-colour-priority" class="w-full bg-white/10 rounded-lg px-2 py-2">
+            <option value="hue" selected>Preserve hue — reduce warm colours turning pink</option>
+            <option value="balanced">Balanced — original OKLab distance</option>
+          </select>
+          <p class="opacity-60">Preserve hue gives colour differences more weight than brightness differences. It can choose a slightly brighter or darker block to retain the colour. Applies to preview and exports immediately.</p>
           <label for="single-scene-colour-profile" class="block">Block colour reference</label>
           <select id="single-scene-colour-profile" class="w-full bg-white/10 rounded-lg px-2 py-2">
             <option value="balanced">Balanced — all six faces</option>

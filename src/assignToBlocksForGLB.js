@@ -27,9 +27,12 @@ let colourProfile = 'balanced';
 export function setBlockColourProfile(profile) { colourProfile = ['balanced', 'top', 'sides'].includes(profile) ? profile : 'balanced'; }
 export function getBlockColourProfile() { return colourProfile; }
 let blockMatchingMode = 'accurate';
+let blockChromaWeight = 2;
+export function setBlockChromaWeight(weight) { blockChromaWeight = Number(weight) === 1 ? 1 : 2; }
+export function getBlockChromaWeight() { return blockChromaWeight; }
 export function getBlockMatchingMode() { return blockMatchingMode; }
 export function setBlockMatchingMode(mode) { blockMatchingMode = mode === 'fast' ? 'fast' : 'accurate'; }
-export function getBlockPaletteKey() { return JSON.stringify([paletteOptions, blockMatchingMode, colourProfile, customBlockNames ? [...customBlockNames].sort() : null]); }
+export function getBlockPaletteKey() { return JSON.stringify([paletteOptions, blockMatchingMode, colourProfile, blockChromaWeight, customBlockNames ? [...customBlockNames].sort() : null]); }
 export function configureBlockPalette(options, customNames = null) {
   paletteOptions = normalizeBlockPalette(options);
   customBlockNames = customNames ? new Set(customNames.map(name => name.replace(/^minecraft:/, ''))) : null;
@@ -383,7 +386,7 @@ function nearestNeighbor(node, L, a, b, best = { d2: Infinity, idx: -1 }) {
   if (!node) return best;
   const bk = BLOCKS[node.blockIndex].oklab;
   const dL = bk.L - L, da = bk.a - a, db = bk.b - b;
-  const d2 = dL*dL + da*da + db*db;
+  const d2 = dL*dL + blockChromaWeight*(da*da + db*db);
   if (d2 < best.d2) { best.d2 = d2; best.idx = node.blockIndex; }
 
   const axis = node.axis;
@@ -394,7 +397,7 @@ function nearestNeighbor(node, L, a, b, best = { d2: Infinity, idx: -1 }) {
 
   best = nearestNeighbor(first, L, a, b, best);
   const delta = queryVal - nodeVal;
-  if (delta*delta < best.d2) best = nearestNeighbor(second, L, a, b, best);
+  if (delta*delta*(axis===0?1:blockChromaWeight) < best.d2) best = nearestNeighbor(second, L, a, b, best);
   return best;
 }
 
@@ -409,6 +412,18 @@ export function iterateVoxelSamples(voxelGrid, fn) {
   const NX = voxelGrid.gridSize.x | 0;
   const NY = voxelGrid.gridSize.y | 0;
   const NZ = voxelGrid.gridSize.z | 0;
+  if (voxelGrid.editorMarkers?.length) {
+    const emit = fn, factor = voxelGrid.exportMetadata?.shapeSampling === 2 ? 2 : 1;
+    const cx=Math.ceil(NX/factor),cy=Math.ceil(NY/factor);
+    const key=(x,y,z)=>x+cx*(y+cy*z);
+    const keys = new Set(voxelGrid.editorMarkers.map(p => key(p.x,p.y,p.z)));
+    for (const p of voxelGrid.editorMarkers) for (let dx=0;dx<factor;dx++) for (let dy=0;dy<factor;dy++) for (let dz=0;dz<factor;dz++) {
+      const x=p.x*factor+dx,y=p.y*factor+dy,z=p.z*factor+dz;
+      if(x<0||y<0||z<0||x>=NX||y>=NY||z>=NZ)throw new Error('Geographic marker lies outside the export grid. Rebuild the preview.');
+      emit({x,y,z,linearIndex:x+NX*(y+NY*z),count:1,r:1,g:0,b:0,alpha:1,state:'red_concrete'});
+    }
+    fn = sample => { if (!keys.has(key(Math.floor(sample.x/factor),Math.floor(sample.y/factor),Math.floor(sample.z/factor)))) emit(sample); };
+  }
   const total = NX * NY * NZ;
   const counts = voxelGrid.voxelCounts;
   const colors = voxelGrid.voxelColors;
@@ -726,6 +741,7 @@ export async function initBlockData() {
 export async function getPackedBlockResources(bias = MC_BRIGHTNESS_BIAS) {
   const paletteKey = getBlockPaletteKey();
   const matchingMode = blockMatchingMode;
+  const chromaWeight = blockChromaWeight;
   await initBlockData();
   if (!BLOCKS.length || !kdTree) throw new Error('Minecraft block palette is unavailable');
   const blocks = BLOCKS, tree = kdTree;
@@ -738,11 +754,11 @@ export async function getPackedBlockResources(bias = MC_BRIGHTNESS_BIAS) {
       if (!node) return;
       const p = blocks[node.blockIndex].oklab;
       const dl = p.L - q.L, da = p.a - q.a, db = p.b - q.b;
-      const distance = dl * dl + da * da + db * db;
+      const distance = dl * dl + chromaWeight*(da * da + db * db);
       if (distance < best.distance) { best.distance = distance; best.index = node.blockIndex; }
       const key = axisKey(node.axis), delta = q[key] - p[key];
       nearest(delta < 0 ? node.left : node.right, q, best);
-      if (delta * delta < best.distance) nearest(delta < 0 ? node.right : node.left, q, best);
+      if (delta * delta*(node.axis===0?1:chromaWeight) < best.distance) nearest(delta < 0 ? node.right : node.left, q, best);
     };
     const best = { distance: Infinity, index: 0 };
     for (let key = 0; key < 65536; key++) {
@@ -773,7 +789,7 @@ export async function getPackedBlockResources(bias = MC_BRIGHTNESS_BIAS) {
       texture.generateMipmaps = false; texture.needsUpdate = true;
     }
     lookup.addEventListener('dispose', () => { paletteLab.dispose(); paletteRects.dispose(); });
-    return { lookup, paletteLab, paletteRects, paletteCount: blocks.length, matchingMode, atlas: await getSharedAtlasTexture(), bias, paletteKey };
+    return { lookup, paletteLab, paletteRects, paletteCount: blocks.length, matchingMode, chromaWeight, atlas: await getSharedAtlasTexture(), bias, paletteKey };
   })();
   // The preview owner retains/disposes the lookup; the image atlas is borrowed.
   return entry.promise;
@@ -965,10 +981,11 @@ export { BLOCKS };
 export { getSharedAtlasTexture };
 
 // Worker-only palette snapshot; avoids image decoding and DOM APIs in exporters.
-export function setExportBlockPalette(blocks, bias = 0, matchingMode = 'accurate') {
+export function setExportBlockPalette(blocks, bias = 0, matchingMode = 'accurate', chromaWeight = 2) {
   BLOCKS = blocks;
   MC_BRIGHTNESS_BIAS = bias;
   setBlockMatchingMode(matchingMode);
+  setBlockChromaWeight(chromaWeight);
   buildBlockKDTree();
 }
 

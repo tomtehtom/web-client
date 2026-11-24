@@ -1,4 +1,5 @@
 import { resolveEarthTileUrl } from './config.js';
+import { CaptureProgress } from './capture-progress.js';
 
 const EARTH_A = 6378137.0;
 const EARTH_F = 1 / 298.257223563;
@@ -111,8 +112,8 @@ function boundingVolumeToSphere(volume) {
 }
 
 export class SingleSceneFetcher {
-  constructor({ concurrency = typeof matchMedia !== 'undefined' && matchMedia('(pointer: coarse)').matches ? 3 : 6, progressIntervalMs = 2000 } = {}) {
-    this.concurrency = Math.max(1, concurrency);
+  constructor({ concurrency = typeof matchMedia !== 'undefined' && matchMedia('(pointer: coarse)').matches ? 6 : 24, progressIntervalMs = 2000 } = {}) {
+    this.concurrency = Number.isFinite(concurrency) ? Math.max(1, Math.min(64, Math.floor(concurrency))) : 24;
     this.progressIntervalMs = progressIntervalMs;
   }
 
@@ -127,8 +128,13 @@ export class SingleSceneFetcher {
       const waiters = [];
       const controller = new AbortController();
       const started = performance.now();
+      const progress = new CaptureProgress(started);
       const stats = { completed: 0, nodes: 0, models: new Set() };
-      const report = () => logFn?.(`Discovering tiles: ${stats.completed} tileset requests complete; ${active} active, ${waiters.length} queued; ${stats.nodes} nodes checked; ${stats.models.size} model tiles found; ${((performance.now() - started) / 1000).toFixed(1)}s elapsed`);
+      const report = () => {
+        const now = performance.now();
+        const eta = progress.estimate(stats.completed, active + waiters.length, now);
+        logFn?.(`Discovering tiles: ${stats.completed} tileset requests complete; ${active} active, ${waiters.length} queued; ${stats.nodes} nodes checked; ${stats.models.size} model tiles found; ${eta.rate.toFixed(1)} requests/s; discovery ETA ${eta.text} (known queue; may grow); ${((now - started) / 1000).toFixed(1)}s elapsed`);
+      };
       const sessionRef = { signal: controller.signal, visited: new Set(), limit: async fn => {
         if (active >= this.concurrency) await new Promise(resolve => waiters.push(resolve));
         else active++;
@@ -145,7 +151,7 @@ export class SingleSceneFetcher {
 
       rootUrl.searchParams.delete('session');
 
-      logFn?.(`Discovering source tiles within ${radius.toFixed(0)} m, ${targetScreenSpaceError === 0 ? 'highest available detail' : `geometric error threshold ${targetScreenSpaceError} m`}`);
+      logFn?.(`Discovering source tiles within ${radius.toFixed(0)} m, ${targetScreenSpaceError === 0 ? 'highest available detail' : `geometric error threshold ${targetScreenSpaceError} m`}; up to ${this.concurrency} parallel discovery requests. ETA covers discovery only; model downloads follow.`);
       const heartbeat = logFn ? setInterval(report, this.progressIntervalMs) : null;
 
       try {
